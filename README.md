@@ -331,3 +331,14 @@ python emotion_concat.py \
   --emotion1 01 --intensity1 01 \
   --emotion2 05 --intensity2 02 \
   --output_dir asset
+
+  # TTO
+
+  ```bash
+  python src/f5_tts/infer/tto.py \
+    --ref-audio src/f5_tts/infer/examples/basic/basic_ref_en.wav \
+    --ref-text "Some call me nature, others call me mother nature." \
+    --gen-text "I don't really care what you call me." \
+    --loss-mode value --opt-at 16,24 --opt-steps 3 --opt-lr 1e-2 \
+    --output tto_demo.wav
+  ```
