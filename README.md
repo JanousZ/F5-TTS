@@ -189,9 +189,12 @@ volumes:
 # Run with flags
 # Leave --ref_text "" will have ASR model transcribe (extra GPU memory usage)
 f5-tts_infer-cli --model F5TTS_v1_Base \
---ref_audio "provide_prompt_wav_path_here.wav" \
---ref_text "The content, subtitle or transcription of reference audio." \
---gen_text "Some text you want TTS model generate for you."
+--ref_audio "asset/actor03_neutral-normal_to_angry-strong.wav" \
+--ref_text "Kids are talking by the door. Kids are talking by the door." \
+--gen_text "I received the gift from another country. It's really delicated and beautiful."
+
+f5-tts_infer-cli --model F5TTS_v1_Base \
+--gen_text "I received the gift from another country."
 
 # Run with default setting. src/f5_tts/infer/examples/basic/basic.toml
 f5-tts_infer-cli
@@ -267,3 +270,64 @@ If our work and codebase is useful for you, please cite as:
 ## License
 
 Our code is released under MIT License. The pre-trained models are licensed under the CC-BY-NC license due to the training data Emilia, which is an in-the-wild dataset. Sorry for any inconvenience this may cause.
+
+# RAVDESS Dataset
+
+The Ryerson Audio-Visual Database of Emotional Speech and Song (RAVDESS)
+
+- 来源: https://zenodo.org/records/1188976
+- 24 位专业演员 (12 男 / 12 女)，使用标准北美口音录制
+- 当前下载内容: Audio Speech (语音音频，1440 个文件)
+
+## 文件命名规则
+
+文件名由 7 个数字编码组成，以 `-` 分隔，格式为:
+
+```
+{模态}-{声道}-{情感}-{情感强度}-{语句}-{重复次数}-{演员编号}.wav
+```
+
+例如: `03-01-06-01-02-01-12.wav`
+
+### 各位置含义
+
+| 位置 | 含义                  | 编码值                                                       |
+| ---- | --------------------- | ------------------------------------------------------------ |
+| 1    | 模态 (Modality)       | 01 = 完整音视频, 02 = 仅视频, 03 = 仅音频                    |
+| 2    | 声道 (Vocal Channel)  | 01 = 语音 (Speech), 02 = 歌曲 (Song)                         |
+| 3    | 情感 (Emotion)        | 01 = 中性, 02 = 平静, 03 = 快乐, 04 = 悲伤, 05 = 愤怒, 06 = 恐惧, 07 = 厌恶, 08 = 惊讶 |
+| 4    | 情感强度 (Intensity)  | 01 = 正常, 02 = 强烈 (中性情感无强烈版本)                    |
+| 5    | 语句 (Statement)      | 01 = "Kids are talking by the door", 02 = "Dogs are sitting by the door" |
+| 6    | 重复次数 (Repetition) | 01 = 第1次, 02 = 第2次                                       |
+| 7    | 演员编号 (Actor)      | 01-24，奇数 = 男性，偶数 = 女性                              |
+
+### 示例
+
+`03-01-05-02-01-01-03.wav` 表示:
+
+- 03 = 仅音频
+- 01 = 语音
+- 05 = 愤怒
+- 02 = 强烈
+- 01 = "Kids are talking by the door"
+- 01 = 第1次重复
+- 03 = 演员03 (男性)
+
+## 目录结构
+
+```
+RAVDESS/
+  Actor_01/    # 演员01 (男)
+  Actor_02/    # 演员02 (女)
+  ...
+  Actor_24/    # 演员24 (女)
+```
+
+每位演员 60 个语音音频文件，共 1440 个文件。
+
+## 情感拼接
+python emotion_concat.py \
+  --actor 03 \
+  --emotion1 01 --intensity1 01 \
+  --emotion2 05 --intensity2 02 \
+  --output_dir asset
