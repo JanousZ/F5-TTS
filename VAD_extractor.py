@@ -106,8 +106,8 @@ def process_func(
 def process_func_framewise(
     x: np.ndarray,
     sampling_rate: int,
-    window_size: float = 1.0,
-    hop_size: float = 0.25,
+    window_size: float = 0.5,
+    hop_size: float = 0.3,
     embeddings: bool = False,
     pad: bool = True,
 ) -> np.ndarray:

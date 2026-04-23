@@ -341,6 +341,7 @@ def _tto_inference_kit(
     vad_level: str = "frame",
     ref_vad_utter: torch.Tensor | None = None,
     on_opt_vad_utter: Callable[[int, int, torch.Tensor], None] | None = None,
+    amp_scale: float = 1.0,
 ):
     """Shared setup + closures for sample_with_tto and its budget-sweep variant.
 
@@ -440,8 +441,12 @@ def _tto_inference_kit(
             gen = gen.to(_vocoder_dtype)
         if vocoder_type == "vocos":
             # bypass vocoder.decode's @torch.inference_mode so grads flow
-            return vocoder.head(vocoder.backbone(gen))
-        return vocoder(gen)
+            wav = vocoder.head(vocoder.backbone(gen))
+        else:
+            wav = vocoder(gen)
+        if amp_scale != 1.0:
+            wav = wav * amp_scale
+        return wav
 
     embeddings_flag = (loss_mode == "embedding")
     _cur = {"step": None, "iter": None}
@@ -595,6 +600,7 @@ def sample_with_tto(
     on_opt_step: Callable[[int, int, float], None] | None = None,
     on_opt_vad: Callable[[int, int, torch.Tensor], None] | None = None,
     on_opt_vad_utter: Callable[[int, int, torch.Tensor], None] | None = None,
+    amp_scale: float = 1.0,
 ):
     """Sample from ``cfm`` with test-time optimization on intermediate latents.
 
@@ -605,6 +611,11 @@ def sample_with_tto(
     ``ref_vad_features``: frame-level features from
     :func:`precompute_reference_vad` (match ``loss_mode``, ``window_size``,
     ``hop_size``). Shape ``(N_ref, D)`` or ``(B, N_ref, D)``.
+
+    ``amp_scale``: multiplier applied to vocoder output (both in VAD loss and
+    final return) to bring generated audio from target_rms back to the
+    reference's original rms domain. Pass ``rms_ref / target_rms`` when the
+    CFM condition was RMS-normalized; leave ``1.0`` otherwise.
 
     ``on_opt_step``: optional callback ``(step_idx, iter_idx, loss)`` invoked
     after each inner update — useful for logging.
@@ -626,6 +637,7 @@ def sample_with_tto(
         vad_level=vad_level, ref_vad_utter=ref_vad_utter,
         on_opt_step=on_opt_step, on_opt_vad=on_opt_vad,
         on_opt_vad_utter=on_opt_vad_utter,
+        amp_scale=amp_scale,
     )
     t_grid = kit["t_grid"]
 
@@ -647,6 +659,8 @@ def sample_with_tto(
         if kit["vocoder_dtype"] is not None and gen_mel.dtype != kit["vocoder_dtype"]:
             gen_mel = gen_mel.to(kit["vocoder_dtype"])
         wav = vocoder.decode(gen_mel) if vocoder_type == "vocos" else vocoder(gen_mel)
+        if amp_scale != 1.0:
+            wav = wav * amp_scale
     return wav, sampled
 
 
@@ -680,6 +694,7 @@ def sample_with_tto_budget_sweep(
     vad_level: str = "frame",
     ref_vad_utter: torch.Tensor | None = None,
     on_opt_step: Callable[[int, int, float], None] | None = None,
+    amp_scale: float = 1.0,
 ) -> dict[int, torch.Tensor]:
     """Budget sweep: share TTO work at the first point across multiple per-point
     iter levels.
@@ -710,6 +725,7 @@ def sample_with_tto_budget_sweep(
         window_size=window_size, hop_size=hop_size,
         vad_level=vad_level, ref_vad_utter=ref_vad_utter,
         on_opt_step=on_opt_step, on_opt_vad=None,
+        amp_scale=amp_scale,
     )
     t_grid = kit["t_grid"]
     first_pt = int(opt_at[0])
@@ -751,6 +767,8 @@ def sample_with_tto_budget_sweep(
             if kit["vocoder_dtype"] is not None and gen_mel.dtype != kit["vocoder_dtype"]:
                 gen_mel = gen_mel.to(kit["vocoder_dtype"])
             wav = vocoder.decode(gen_mel) if vocoder_type == "vocos" else vocoder(gen_mel)
+            if amp_scale != 1.0:
+                wav = wav * amp_scale
         results[L] = wav
 
     return results
@@ -866,13 +884,26 @@ if __name__ == "__main__":
     opt_schedule = [int(s) for s in args.opt_at.split(",") if s.strip()]
 
     def _run_one(ref_audio_path: str, out_path: str, viz_base: str | None) -> None:
-        # Load reference audio, mono-mix, RMS-normalize, resample to 24 kHz.
+        # Load reference audio, mono-mix.
         ref_wav, sr = torchaudio.load(ref_audio_path)
         if ref_wav.shape[0] > 1:
             ref_wav = ref_wav.mean(dim=0, keepdim=True)
+
+        # Raw copy at native sr (no RMS scaling) for VAD extraction — matches
+        # VAD_extractor.process_func semantics on the original audio.
+        ref_wav_for_vad = ref_wav.to(device)
+
+        # CFM conditioning path: RMS-normalize + resample to 24 kHz. When the
+        # ref was scaled up to target_rms, gen comes out in target_rms domain,
+        # so we pass amp_scale = rms/target_rms back into sample_with_tto to
+        # pull gen wav back to the ref's original amplitude (matches
+        # utils_infer.py:514-515 and makes VAD loss same-domain vs ref VAD).
         rms = torch.sqrt(torch.mean(ref_wav.square()))
         if rms < target_rms:
             ref_wav = ref_wav * target_rms / rms
+            amp_scale = float(rms / target_rms)
+        else:
+            amp_scale = 1.0
         if sr != target_sample_rate:
             ref_wav = torchaudio.transforms.Resample(sr, target_sample_rate)(ref_wav)
         ref_wav = ref_wav.to(device)
@@ -890,22 +921,22 @@ if __name__ == "__main__":
         emb_flag = (args.loss_mode == "embedding")
         if args.vad_level == "utter":
             ref_vad = precompute_reference_vad(
-                vad, ref_wav.squeeze(0),
-                in_sr=target_sample_rate,
+                vad, ref_wav_for_vad.squeeze(0),
+                in_sr=sr,
                 embeddings=emb_flag, utter=True,
             )
             ref_vad_u = None
         else:
             ref_vad = precompute_reference_vad(
-                vad, ref_wav.squeeze(0),
-                in_sr=target_sample_rate,
+                vad, ref_wav_for_vad.squeeze(0),
+                in_sr=sr,
                 window_size=args.window_size, hop_size=args.hop_size,
                 embeddings=emb_flag,
             )
             if args.vad_level == "both":
                 ref_vad_u = precompute_reference_vad(
-                    vad, ref_wav.squeeze(0),
-                    in_sr=target_sample_rate,
+                    vad, ref_wav_for_vad.squeeze(0),
+                    in_sr=sr,
                     embeddings=emb_flag, utter=True,
                 )
             else:
@@ -913,19 +944,21 @@ if __name__ == "__main__":
         print(
             f"ref VAD: primary={tuple(ref_vad.shape)} "
             f"utter={None if ref_vad_u is None else tuple(ref_vad_u.shape)}  "
-            f"(loss_mode={args.loss_mode} vad_level={args.vad_level})"
+            f"(loss_mode={args.loss_mode} vad_level={args.vad_level})\n"
+            #f"ref_VAD: {ref_vad}"
         )
+
         if viz_base:
             ref_vad_val = precompute_reference_vad(
-                vad, ref_wav.squeeze(0),
-                in_sr=target_sample_rate,
+                vad, ref_wav_for_vad.squeeze(0),
+                in_sr=sr,
                 window_size=args.window_size, hop_size=args.hop_size,
                 embeddings=False,
             )
             if args.vad_level in ("utter", "both"):
                 ref_vad_val_utter = precompute_reference_vad(
-                    vad, ref_wav.squeeze(0),
-                    in_sr=target_sample_rate,
+                    vad, ref_wav_for_vad.squeeze(0),
+                    in_sr=sr,
                     embeddings=False, utter=True,
                 )
             else:
@@ -974,6 +1007,7 @@ if __name__ == "__main__":
             on_opt_step=_log,
             on_opt_vad=_record,
             on_opt_vad_utter=_record_utter,
+            amp_scale=amp_scale,
         )
         wav_np = wav.squeeze().detach().float().cpu().numpy()
         sf.write(out_path, wav_np, target_sample_rate, subtype="FLOAT")

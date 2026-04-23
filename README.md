@@ -343,13 +343,13 @@ python emotion_concat.py \
 
 ```bash
 python src/f5_tts/infer/tto.py \
-  --ref-audio asset/actor02_angry-strong_to_sad-strong.wav \
+  --ref-audio asset/actor01_fearful-normal_to_disgust-strong.wav \
   --ref-text "Kids are talking by the door. Kids are talking by the door." \
   --gen-text "Kids are talking by the door. Kids are talking by the door." \
-  --loss-mode value --opt-at 2,4,6,8--opt-steps 200 --opt-lr 1e-2 \
+  --loss-mode value --opt-at 2,4,6,8,10,12,14,18,24,28 --opt-steps 50 --opt-lr 1e-2 \
   --vad-level frame \
   --output tto_demo.wav \
-  --window-size 0.3 --hop-size 0.15 \
+  --window-size 1.0 --hop-size 0.25 \
   --viz-path vis
 
 python src/f5_tts/infer/tto.py \
