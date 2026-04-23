@@ -327,18 +327,52 @@ RAVDESS/
 
 ## 情感拼接
 python emotion_concat.py \
-  --actor 03 \
-  --emotion1 01 --intensity1 01 \
+  --actor 06 \
+  --emotion1 03 --intensity1 02 \
   --emotion2 05 --intensity2 02 \
   --output_dir asset
 
-  # TTO
+python emotion_concat.py \
+  --actor 01,02,03,04,05,06,07,08,09,10 \
+  --emotion1 03,05,06 --intensity1 01,02 \
+  --emotion2 07,08,04 --intensity2 01,02 \
+  --skip_existing \
+  --output_dir asset
 
-  ```bash
-  python src/f5_tts/infer/tto.py \
-    --ref-audio src/f5_tts/infer/examples/basic/basic_ref_en.wav \
-    --ref-text "Some call me nature, others call me mother nature." \
-    --gen-text "I don't really care what you call me." \
-    --loss-mode value --opt-at 16,24 --opt-steps 3 --opt-lr 1e-2 \
-    --output tto_demo.wav
-  ```
+# TTO
+
+```bash
+python src/f5_tts/infer/tto.py \
+  --ref-audio asset/actor02_angry-strong_to_sad-strong.wav \
+  --ref-text "Kids are talking by the door. Kids are talking by the door." \
+  --gen-text "Kids are talking by the door. Kids are talking by the door." \
+  --loss-mode value --opt-at 2,4,6,8--opt-steps 200 --opt-lr 1e-2 \
+  --vad-level frame \
+  --output tto_demo.wav \
+  --window-size 0.3 --hop-size 0.15 \
+  --viz-path vis
+
+python src/f5_tts/infer/tto.py \
+  --ref-audio asset/actor02_angry-strong_to_sad-strong.wav \
+  --ref-text "Kids are talking by the door. Kids are talking by the door." \
+  --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
+  --opt-at "" \
+  --output plain_demo.wav
+
+#批量处理
+python src/f5_tts/infer/tto.py \
+  --ref-text "Kids are talking by the door. Kids are talking by the door." \
+  --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
+  --loss-mode value --opt-at 16,24 --opt-steps 3 --opt-lr 1e-2 \
+  --batch-size 10 \
+  --ref-dir asset \
+  --output tto_outputs \
+  --viz-path tto_viz \
+  --seed 42
+
+python src/f5_tts/infer/run_budget_sweep.py \
+  --n-samples 5 \
+  --out-dir experiments/budget_sweep
+
+python src/f5_tts/infer/aggregate_budget_sweep.py \
+  --run-dir experiments/budget_sweep/20260422_042004

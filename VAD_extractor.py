@@ -1,7 +1,10 @@
+import json
+import os
+
 import numpy as np
 import torch
 import torch.nn as nn
-from transformers import Wav2Vec2Processor
+from transformers import Wav2Vec2Config, Wav2Vec2FeatureExtractor
 from transformers.models.wav2vec2.modeling_wav2vec2 import (
     Wav2Vec2Model,
     Wav2Vec2PreTrainedModel,
@@ -41,7 +44,7 @@ class EmotionModel(Wav2Vec2PreTrainedModel):
         self.config = config
         self.wav2vec2 = Wav2Vec2Model(config)
         self.classifier = RegressionHead(config)
-        self.init_weights()
+        self.post_init()
 
     def forward(
             self,
@@ -59,9 +62,16 @@ class EmotionModel(Wav2Vec2PreTrainedModel):
 
 # load model from hub
 device = 'cpu'
-model_name = 'audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim'
-processor = Wav2Vec2Processor.from_pretrained(model_name)
-model = EmotionModel.from_pretrained(model_name).to(device)
+model_name = '/mnt/disk1/models/wav2vec2-large-robust-12-ft-emotion-msp-dim'
+
+with open(os.path.join(model_name, 'config.json')) as f:
+    _cfg_dict = json.load(f)
+if _cfg_dict.get('vocab_size') is None:
+    _cfg_dict['vocab_size'] = 32
+config = Wav2Vec2Config(**_cfg_dict)
+
+processor = Wav2Vec2FeatureExtractor.from_pretrained(model_name)
+model = EmotionModel.from_pretrained(model_name, config=config).to(device)
 
 # dummy signal
 sampling_rate = 16000
@@ -142,18 +152,33 @@ def process_func_framewise(
     return np.stack(frames, axis=0)
 
 
-print(process_func(signal, sampling_rate))
-#  Arousal    dominance valence
-# [[0.5460754  0.6062266  0.40431657]]
+if __name__ == '__main__':
+    import argparse, sys
+    import soundfile as sf
 
-print(process_func(signal, sampling_rate, embeddings=True))
-# Pooled hidden states of last transformer layer
-# [[-0.00752167  0.0065819  -0.00746342 ...  0.00663632  0.00848748
-#    0.00599211]]
+    ap = argparse.ArgumentParser()
+    ap.add_argument('audio', nargs='?', help='audio file; omit to run dummy demo')
+    ap.add_argument('--framewise', action='store_true')
+    ap.add_argument('--embeddings', action='store_true')
+    args = ap.parse_args()
 
-print(process_func_framewise(signal, sampling_rate).shape)
-# (num_frames, 3) — per-window arousal/dominance/valence
+    if args.audio is None:
+        sig = signal
+    else:
+        sig, sr = sf.read(args.audio, dtype='float32', always_2d=False)
+        if sig.ndim == 2:
+            sig = sig.mean(axis=1)
+        if sr != sampling_rate:
+            import torchaudio
+            sig = torchaudio.functional.resample(
+                torch.from_numpy(sig).unsqueeze(0), sr, sampling_rate,
+            ).squeeze(0).numpy()
+        sig = sig[np.newaxis, :]
 
-print(process_func_framewise(signal, sampling_rate, embeddings=True).shape)
-# (num_frames, hidden_size) — per-window pooled hidden states
+    if args.framewise:
+        out = process_func_framewise(sig, sampling_rate, embeddings=args.embeddings)
+    else:
+        out = process_func(sig, sampling_rate, embeddings=args.embeddings)
+    print(out.shape)
+    print(out)
 
