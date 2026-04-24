@@ -333,9 +333,9 @@ python emotion_concat.py \
   --output_dir asset
 
 python emotion_concat.py \
-  --actor 01,02,03,04,05,06,07,08,09,10 \
-  --emotion1 03,05,06 --intensity1 01,02 \
-  --emotion2 07,08,04 --intensity2 01,02 \
+  --actor 03,\
+  --emotion1 03,05,06 --intensity1 02 \
+  --emotion2 07,08,04 --intensity2 02 \
   --skip_existing \
   --output_dir asset
 
@@ -343,19 +343,19 @@ python emotion_concat.py \
 
 ```bash
 python src/f5_tts/infer/tto.py \
-  --ref-audio asset/actor01_fearful-normal_to_disgust-strong.wav \
+  --ref-audio asset/actor04_angry-strong_to_sad-strong.wav \
   --ref-text "Kids are talking by the door. Kids are talking by the door." \
   --gen-text "Kids are talking by the door. Kids are talking by the door." \
-  --loss-mode value --opt-at 2,4,6,8,10,12,14,18,24,28 --opt-steps 50 --opt-lr 1e-2 \
+  --loss-mode value --opt-at 2,4,6,8,10,12,14,16,18,20,24,28 --opt-steps 50 --opt-lr 1e-2 \
   --vad-level frame \
   --output tto_demo.wav \
   --window-size 1.0 --hop-size 0.25 \
   --viz-path vis
 
 python src/f5_tts/infer/tto.py \
-  --ref-audio asset/actor02_angry-strong_to_sad-strong.wav \
+  --ref-audio asset/actor03_angry-strong_to_sad-strong.wav \
   --ref-text "Kids are talking by the door. Kids are talking by the door." \
-  --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
+  --gen-text "Kids are talking by the door. Kids are talking by the door." \
   --opt-at "" \
   --output plain_demo.wav
 
@@ -363,12 +363,13 @@ python src/f5_tts/infer/tto.py \
 python src/f5_tts/infer/tto.py \
   --ref-text "Kids are talking by the door. Kids are talking by the door." \
   --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
-  --loss-mode value --opt-at 16,24 --opt-steps 3 --opt-lr 1e-2 \
-  --batch-size 10 \
+  --loss-mode value --opt-at 2,4,6,8,10,12,14,16,18,20,24,28 --opt-steps 30 --opt-lr 1e-2 \
+  --vad-level both \
+  --window-size 1.0 --hop-size 0.5 \
+  --batch-size 8 \
   --ref-dir asset \
-  --output tto_outputs \
-  --viz-path tto_viz \
-  --seed 42
+  --output tto_outputs/1.0_0.5_both \
+  --viz-path tto_viz/1.0_0.5_both
 
 python src/f5_tts/infer/run_budget_sweep.py \
   --n-samples 5 \
@@ -376,3 +377,9 @@ python src/f5_tts/infer/run_budget_sweep.py \
 
 python src/f5_tts/infer/aggregate_budget_sweep.py \
   --run-dir experiments/budget_sweep/20260422_042004
+
+#指标检测
+python src/f5_tts/infer/eval_metric.py \
+  --ref ./asset/actor01_angry-strong_to_surprised-strong.wav \
+  --gen ./asset/actor01_happy-strong_to_sad-strong.wav \
+  --text "Some call me nature, others call me mother nature."

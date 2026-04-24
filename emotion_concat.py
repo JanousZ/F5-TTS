@@ -67,7 +67,7 @@ def find_audio(dataset_dir, actor, emotion, intensity, statement="01", repetitio
     return None
 
 
-def trim_silence(wav, threshold_db=-70):
+def trim_silence(wav, threshold_db=-80):
     """
     裁掉音频首尾的静音部分。
     threshold_db: 低于此分贝的视为静音，越小越宽松（保留更多）。
