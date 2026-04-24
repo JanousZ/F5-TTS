@@ -801,6 +801,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="F5-TTS TTO demo")
     parser.add_argument("--model", default="F5TTS_v1_Base")
     parser.add_argument(
+        "--ckpt-file", default="",
+        help="本地 CFM 权重 (.safetensors / .pt)；空则走 HF cache",
+    )
+    parser.add_argument(
+        "--vocab-file", default="",
+        help="本地 vocab.txt；空则用包内默认",
+    )
+    parser.add_argument(
+        "--vocoder-local-path", default="",
+        help="本地 vocoder 目录 (vocos: 含 config.yaml + pytorch_model.bin)；空则走 HF",
+    )
+    parser.add_argument(
         "--ref-audio",
         default=str(files("f5_tts").joinpath("infer/examples/basic/basic_ref_en.wav")),
     )
@@ -878,7 +890,12 @@ if __name__ == "__main__":
         viz_dir = None
 
     # --- load models ONCE ---
-    tts = F5TTS(model=args.model)
+    tts = F5TTS(
+        model=args.model,
+        ckpt_file=args.ckpt_file or "",
+        vocab_file=args.vocab_file or "",
+        vocoder_local_path=args.vocoder_local_path or None,
+    )
     device = tts.device
     vad = GradVADExtractor(in_sr=target_sample_rate, device=device)
     opt_schedule = [int(s) for s in args.opt_at.split(",") if s.strip()]

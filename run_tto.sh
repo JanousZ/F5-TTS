@@ -15,6 +15,11 @@ REF_TEXT="Kids are talking by the door. Kids are talking by the door."
 GEN_TEXT="Dogs are walking on the floor. Dogs are walking on the floor."
 SKIP_EVAL=0
 
+# 本地权重（留空则走 HF cache）。
+CKPT_FILE=/mnt/disk1/models/F5-TTS_Emilia-ZH-EN/model_1250000.safetensors
+VOCAB_FILE=/mnt/disk1/models/F5-TTS_Emilia-ZH-EN/vocab.txt
+VOCODER_LOCAL_PATH=/mnt/disk1/models/vocos-mel-24khz
+
 usage() {
   cat <<EOF
 Usage: $0 [options]
@@ -59,7 +64,13 @@ cd "$(dirname "$0")"
 OUT_DIR="tto_outputs/${TAG}"
 VIZ_DIR="tto_viz/${TAG}"
 
+extra_tto_args=()
+[[ -n "${CKPT_FILE}"          ]] && extra_tto_args+=(--ckpt-file          "${CKPT_FILE}")
+[[ -n "${VOCAB_FILE}"         ]] && extra_tto_args+=(--vocab-file         "${VOCAB_FILE}")
+[[ -n "${VOCODER_LOCAL_PATH}" ]] && extra_tto_args+=(--vocoder-local-path "${VOCODER_LOCAL_PATH}")
+
 python src/f5_tts/infer/tto.py \
+  "${extra_tto_args[@]}" \
   --ref-text "${REF_TEXT}" \
   --gen-text "${GEN_TEXT}" \
   --loss-mode "${LOSS_MODE}" \
