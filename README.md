@@ -383,3 +383,50 @@ python src/f5_tts/infer/eval_metric.py \
   --ref ./asset/actor01_angry-strong_to_surprised-strong.wav \
   --gen ./asset/actor01_happy-strong_to_sad-strong.wav \
   --text "Some call me nature, others call me mother nature."
+
+# 批量生成 + 自动配对评测 (run_tto.sh)
+
+单次跑：从 `--ref-dir` 随机采 `--batch-size` 条 ref 生成，结束后自动对每条 gen/ref 配对调 `batch_eval.py`，CSV+summary 落到 `tto_outputs/<TAG>/`。TAG 前缀带 `<loss-mode>-<vad-level>`，不同组合互不覆盖。
+
+```bash
+./run_tto.sh                               # 默认: value+frame, w=1.0 h=0.5, 8 条
+./run_tto.sh --loss-mode embedding --vad-level both --opt-steps 30
+./run_tto.sh --skip-eval                   # 只生成，不评测
+
+# 查看结果
+ls tto_outputs/<TAG>/                      # metrics.csv + metrics.summary.txt + *.wav
+cat tto_outputs/*/metrics.summary.txt      # 所有 TAG 聚合统计
+```
+
+可配置项：`--window-size / --hop-size / --opt-at / --opt-steps / --opt-lr / --loss-mode / --vad-level / --batch-size / --ref-dir`。
+
+# 批量扫参 + 多 GPU 并行 (sweep_tto.sh)
+
+config 行格式：`ws|hs|opt_at|opt_steps|lr|loss_mode|vad_level`，每行调一次 `run_tto.sh`，多卡时按任务队列动态分派。
+
+```bash
+# 单 GPU 串行（原行为）
+./sweep_tto.sh
+
+# 4 卡并行
+./sweep_tto.sh --gpus 0-3
+
+# 多卡生成 + 串行评测（显存吃紧时推荐）
+./sweep_tto.sh --gpus 0-3 --defer-eval
+
+# 混合 GPU id
+./sweep_tto.sh --gpus 0,1,3,5-6
+```
+
+- **工作队列**：每张 GPU 始终只跑一个 config，跑完自动领下一个；不做静态切分，任务时长不均也不空转。
+- **日志分离**：并发 stdout 会互相覆盖，每个 run 的完整输出到 `tto_outputs/_logs/<ts>/<idx>_gpu<N>_<TAG>.log`，用 `tail -f` 跟进。
+- **`--defer-eval`**：生成阶段传 `--skip-eval` 给 `run_tto.sh`，全跑完后再在第一张 GPU 上串行评测——避免在 TTO 采样器之上再叠 ~5 GB 的 eval 模型栈。
+- **Ctrl-C**：trap 会杀掉所有 children，不留孤儿进程。
+
+跨 config 对比：
+
+```bash
+for f in tto_outputs/*/metrics.summary.txt; do
+  echo "=== $f ==="; grep -E "^(emo_jsd|utmos|spk_sim|wer)" "$f"
+done
+```
