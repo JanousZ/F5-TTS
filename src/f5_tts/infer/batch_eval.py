@@ -24,8 +24,20 @@ from f5_tts.infer.eval_metric import evaluate_all
 
 
 SCALAR_COLS = ["wer", "cer", "utmos", "spk_sim",
-               "emo_kl", "emo_jsd", "emo_top1_match"]
-STR_COLS = ["emo_gen_label", "emo_ref_label", "hyp"]
+               "e2v_dtw_jsd", "e2v_frame_jsd_mean",
+               "e2v_label_edit_norm", "e2v_top_label_match"]
+# Lists are serialized to ';'-joined strings before write (see _csv_serialize).
+STR_COLS = ["e2v_gen_label_seq", "e2v_ref_label_seq",
+            "e2v_gen_probs_mean", "e2v_ref_probs_mean", "hyp"]
+
+
+def _csv_serialize(v):
+    """Flatten list-valued cells to a ';'-joined string for clean CSVs."""
+    if isinstance(v, list):
+        if v and isinstance(v[0], float):
+            return ";".join(f"{x:.4f}" for x in v)
+        return ";".join(str(x) for x in v)
+    return v
 
 
 def main() -> int:
@@ -65,7 +77,7 @@ def main() -> int:
         text_metric = "wer" if "wer" in r else "cer"
         print(f"[{i:02d}/{len(gen_paths)}] {gp.stem:30s}  "
               f"{text_metric}={r[text_metric]:.3f}  utmos={r['utmos']:.2f}  "
-              f"spk={r['spk_sim']:.3f}  emo_jsd={r['emo_jsd']:.3f}  "
+              f"spk={r['spk_sim']:.3f}  e2v_dtw={r['e2v_dtw_jsd']:.3f}  "
               f"[{dt:.1f}s]")
 
     if not rows:
@@ -80,7 +92,7 @@ def main() -> int:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
         for r in rows:
-            w.writerow({c: r.get(c, "") for c in cols})
+            w.writerow({c: _csv_serialize(r.get(c, "")) for c in cols})
 
     # --- aggregate summary ---
     def _stats(key):

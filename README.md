@@ -427,6 +427,6 @@ config 行格式：`ws|hs|opt_at|opt_steps|lr|loss_mode|vad_level`，每行调�
 
 ```bash
 for f in tto_outputs/*/metrics.summary.txt; do
-  echo "=== $f ==="; grep -E "^(emo_jsd|utmos|spk_sim|wer)" "$f"
+  echo "=== $f ==="; grep -E "^(e2v_dtw_jsd|e2v_frame_jsd_mean|e2v_label_edit_norm|e2v_top_label_match|utmos|spk_sim|wer)" "$f"
 done
 ```

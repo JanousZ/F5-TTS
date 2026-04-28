@@ -5,23 +5,30 @@ Metrics (all take gen_wav / ref_wav / gen_text + sampling rates, return dict):
                            WER otherwise). Lower is better.
     compute_utmos        — UTMOS22 naturalness / artifact score. Higher better.
     compute_speaker_sim  — WavLM-SV x-vector cosine vs ref wav. Higher better.
-    compute_emotion_sim  — Independent IEMOCAP SER (superb/wav2vec2-base-superb-er),
-                           trained on a *different* corpus than tto.py's VAD
-                           model so it is a fair out-of-sample check. Returns
-                           KL / JSD between gen and ref probability vectors,
-                           top-1 label agreement, and raw probs.
+    compute_emotion_sim  — emotion2vec_plus_large 9-class SLIDING-WINDOW
+                           trajectory comparison. Pipeline:
+                             full audio → backbone → (T, 1024) hidden once
+                             → sliding window mean over T → (n_win, 1024)
+                             → backbone.proj → (n_win, 9) raw softmax (no
+                               funasr 'unuse' mask — all 9 classes exposed:
+                               angry/disgusted/fearful/happy/neutral/other/
+                               sad/surprised/unknown).
+                           Compares gen and ref trajectories via DTW(JSD),
+                           interp-aligned mean JSD, and label-sequence edit
+                           distance. Captures emotion CHANGE, not just
+                           utter-level distribution match.
 
 Plus ``evaluate_all`` that runs all four and merges the result dicts.
 
 Inputs: wav can be a file path (str), a 1D/2D torch.Tensor, or a numpy array.
 When tensor/ndarray is passed, ``sr`` is required.
 
-Extra pip deps (not part of F5-TTS base): ``jiwer``.
-All four model weights live under ``/mnt/disk1/models/tts_eval/``:
-    whisper-large-v3/     — OpenAI Whisper (HF snapshot)
-    wavlm-base-plus-sv/   — Microsoft WavLM-SV x-vector (HF snapshot)
-    wav2vec2-superb-er/   — superb IEMOCAP 4-class SER (HF snapshot)
-    utmos_hub/hub/        — torch.hub repo + checkpoints for UTMOS22
+Extra pip deps (not part of F5-TTS base): ``jiwer``, ``funasr``.
+Model weights live under ``/mnt/disk1/models/``:
+    tts_eval/whisper-large-v3/   — OpenAI Whisper (HF snapshot)
+    tts_eval/wavlm-base-plus-sv/ — Microsoft WavLM-SV x-vector
+    tts_eval/utmos_hub/hub/      — torch.hub repo + checkpoints for UTMOS22
+    emotion2vec_plus_large/      — funasr-style emotion2vec checkpoint
 """
 
 from __future__ import annotations
@@ -38,11 +45,22 @@ import torchaudio
 _LOCAL_ROOT = "/mnt/disk1/models/tts_eval"
 WHISPER_MODEL = f"{_LOCAL_ROOT}/whisper-large-v3"
 WAVLM_SV_MODEL = f"{_LOCAL_ROOT}/wavlm-base-plus-sv"
-SER_MODEL = f"{_LOCAL_ROOT}/wav2vec2-superb-er"
 UTMOS_HUB_DIR = f"{_LOCAL_ROOT}/utmos_hub/hub"
 UTMOS_REPO = "tarepan/SpeechMOS:v1.2.0"
 UTMOS_NAME = "utmos22_strong"
 TARGET_SR = 16000
+
+# emotion2vec_plus_large: 9-class emotion classifier on a data2vec backbone.
+# Frame rate is ~50 Hz (20 ms hop) coming out of the wav2vec2-style encoder.
+# tokens.txt has placeholder names ("unuse_0/1/2/3") for indices 1, 2, 5, 7;
+# the trained proj head is genuinely 9-d and we read all 9 logits, NOT the
+# 5-class mask that funasr's inference() applies.
+E2V_MODEL = "/mnt/disk1/models/emotion2vec_plus_large"
+E2V_FRAME_HZ = 50
+E2V_CLASSES = (
+    "angry", "disgusted", "fearful", "happy", "neutral",
+    "other", "sad", "surprised", "unknown",
+)
 
 WavLike = Union[torch.Tensor, np.ndarray, str]
 _MODELS: dict = {}
@@ -200,27 +218,108 @@ def compute_speaker_sim(
     return {"spk_sim": sim}
 
 
-def _ser_bundle(device):
-    from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
-    key = ("ser", str(device))
+def _e2v_load(device):
+    """Lazy-load emotion2vec_plus_large (funasr backbone). Caches on device."""
+    key = ("emotion2vec", str(device))
     if key not in _MODELS:
-        fe = AutoFeatureExtractor.from_pretrained(SER_MODEL)
-        model = AutoModelForAudioClassification.from_pretrained(SER_MODEL)
-        model = model.to(device).eval()
-        labels = [model.config.id2label[i] for i in range(model.config.num_labels)]
-        _MODELS[key] = (fe, model, labels)
+        from funasr import AutoModel
+        m = AutoModel(model=E2V_MODEL, disable_update=True, device=str(device))
+        backbone = m.model.to(device).eval()
+        _MODELS[key] = backbone
     return _MODELS[key]
 
 
-def _ser_probs(wav: WavLike, sr: int | None, device) -> tuple[torch.Tensor, list[str]]:
-    fe, model, labels = _ser_bundle(device)
+def _e2v_extract_hidden(
+    wav: WavLike, sr: int | None, device,
+) -> torch.Tensor:
+    """Run the FULL audio through emotion2vec once, return last-layer hidden.
+
+    Returns ``(T_frame, 1024)`` on the same device as the model. Frame rate is
+    fixed by the data2vec audio encoder (~50 Hz, 20 ms / frame).
+    """
+    backbone = _e2v_load(device)
     w, s = _load_wav(wav, sr)
-    w_16k = _to_16k_mono(w, s).numpy()
-    inputs = fe(w_16k, sampling_rate=TARGET_SR, return_tensors="pt", padding=True)
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    w_16k = _to_16k_mono(w, s).to(device)
+    src = F.layer_norm(w_16k, w_16k.shape).view(1, -1)
     with torch.no_grad():
-        logits = model(**inputs).logits
-    return logits.softmax(dim=-1).squeeze(0).cpu(), labels
+        feats = backbone.extract_features(src, padding_mask=None)
+    return feats["x"].squeeze(0)  # (T, 1024)
+
+
+def _e2v_window_classify(
+    hidden: torch.Tensor, window_s: float, hop_s: float, device,
+) -> torch.Tensor:
+    """Slide window over (T, D) hidden, mean-pool per window, apply proj.
+
+    Sliding happens on the **hidden state**, not the raw audio — so the
+    backbone only ran once. Returns ``(n_win, 9)`` raw softmax (no funasr
+    'unuse' mask).
+    """
+    backbone = _e2v_load(device)
+    win = max(1, int(round(window_s * E2V_FRAME_HZ)))
+    hop = max(1, int(round(hop_s * E2V_FRAME_HZ)))
+    T = hidden.shape[0]
+    if T < win:
+        pooled = hidden.mean(dim=0, keepdim=True)  # (1, D) fallback
+    else:
+        windows = hidden.unfold(0, win, hop)        # (n_win, D, win)
+        pooled = windows.mean(dim=-1)               # (n_win, D)
+    with torch.no_grad():
+        logits = backbone.proj(pooled)              # (n_win, 9) — raw, all 9 classes
+    return logits.softmax(dim=-1)                   # (n_win, 9)
+
+
+def _interp_time(probs: torch.Tensor, target_len: int) -> torch.Tensor:
+    """Linear interp a (N, K) prob trajectory to (target_len, K).
+
+    Linear interpolation of probability rows preserves row sum=1 (linear
+    combinations of distributions stay distributions).
+    """
+    if probs.shape[0] == target_len:
+        return probs
+    p = probs.transpose(0, 1).unsqueeze(0)  # (1, K, N)
+    p = F.interpolate(p, size=target_len, mode="linear", align_corners=False)
+    return p.squeeze(0).transpose(0, 1)     # (target_len, K)
+
+
+def _levenshtein(a: list, b: list) -> int:
+    m, n = len(a), len(b)
+    if m == 0: return n
+    if n == 0: return m
+    prev = list(range(n + 1))
+    for i in range(1, m + 1):
+        cur = [i] + [0] * n
+        for j in range(1, n + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost)
+        prev = cur
+    return prev[n]
+
+
+def _dtw_jsd(gen_probs: torch.Tensor, ref_probs: torch.Tensor) -> float:
+    """DTW(gen ↔ ref) with per-cell cost = JSD(gen[i], ref[j]).
+
+    Returns accumulated cost normalized by warping-path length, so values are
+    comparable across different (n_g, n_r). Range roughly [0, ln 2 ≈ 0.693].
+    """
+    import librosa.sequence
+    eps = 1e-8
+    g = gen_probs.detach().cpu().numpy()
+    r = ref_probs.detach().cpu().numpy()
+    g_exp = g[:, None, :]                    # (Ng, 1, K)
+    r_exp = r[None, :, :]                    # (1, Nr, K)
+    m = 0.5 * (g_exp + r_exp)
+    log_g = np.log(np.clip(g_exp, eps, None))
+    log_r = np.log(np.clip(r_exp, eps, None))
+    log_m = np.log(np.clip(m, eps, None))
+    cost = (
+        0.5 * (g_exp * (log_g - log_m)).sum(-1) +
+        0.5 * (r_exp * (log_r - log_m)).sum(-1)
+    ).astype(np.float32)
+    if cost.shape[0] == 0 or cost.shape[1] == 0:
+        return 0.0
+    D, wp = librosa.sequence.dtw(C=cost, subseq=False)
+    return float(D[-1, -1] / max(len(wp), 1))
 
 
 def compute_emotion_sim(
@@ -230,37 +329,69 @@ def compute_emotion_sim(
     sr_ref: int | None = None,
     *,
     device: str | torch.device = "cuda",
+    window_s: float = 1.0,
+    hop_s: float = 0.25,
 ) -> dict:
-    """Independent SER on gen & ref; compare probability distributions.
+    """emotion2vec_plus_large 9-class sliding-window trajectory comparison.
 
-    Uses an IEMOCAP-trained classifier, which is cross-corpus w.r.t. the
-    MSP-Podcast-trained VAD model used in tto.py — makes this a fair out-of-
-    sample emotion check.
+    Captures emotion CHANGE over time, not just utter-level distribution
+    match. Window/hop are in seconds, applied to the hidden-state time axis
+    after a single full-audio backbone pass.
 
-    Returns KL(ref||gen), JSD, top-1 label match, and both probability vectors.
+    Returns:
+      e2v_dtw_jsd          DTW distance (JSD per-cell), normalized by path
+                           length. ↓ better.
+      e2v_frame_jsd_mean   gen/ref interpolated to common length, then mean
+                           per-window JSD. ↓ better.
+      e2v_label_edit_norm  Levenshtein over per-window argmax label
+                           sequences, normalized by max(len). ↓ better.
+      e2v_top_label_match  1 iff argmax(mean_pool(gen_probs)) ==
+                           argmax(mean_pool(ref_probs)).
+      e2v_classes          tuple of 9 class names (fixed order).
+      e2v_gen_label_seq    list[str], top-1 label per gen window.
+      e2v_ref_label_seq    list[str], top-1 label per ref window.
+      e2v_gen_probs_mean   list[9], gen window-averaged probability vector.
+      e2v_ref_probs_mean   list[9], ref window-averaged probability vector.
     """
-    p_gen, labels = _ser_probs(gen_wav, sr_gen, device)
-    p_ref, _ = _ser_probs(ref_wav, sr_ref, device)
+    gen_hidden = _e2v_extract_hidden(gen_wav, sr_gen, device)
+    ref_hidden = _e2v_extract_hidden(ref_wav, sr_ref, device)
 
+    gen_probs = _e2v_window_classify(gen_hidden, window_s, hop_s, device).cpu()
+    ref_probs = _e2v_window_classify(ref_hidden, window_s, hop_s, device).cpu()
+
+    gen_seq = [E2V_CLASSES[int(i)] for i in gen_probs.argmax(dim=-1).tolist()]
+    ref_seq = [E2V_CLASSES[int(i)] for i in ref_probs.argmax(dim=-1).tolist()]
+
+    target_len = max(gen_probs.shape[0], ref_probs.shape[0], 1)
+    g_aligned = _interp_time(gen_probs, target_len)
+    r_aligned = _interp_time(ref_probs, target_len)
     eps = 1e-8
-    log_gen = p_gen.clamp(min=eps).log()
-    log_ref = p_ref.clamp(min=eps).log()
-    kl = float((p_ref * (log_ref - log_gen)).sum())
-    m = 0.5 * (p_gen + p_ref)
+    log_g = g_aligned.clamp(min=eps).log()
+    log_r = r_aligned.clamp(min=eps).log()
+    m = 0.5 * (g_aligned + r_aligned)
     log_m = m.clamp(min=eps).log()
-    jsd = 0.5 * float((p_gen * (log_gen - log_m)).sum()) + \
-          0.5 * float((p_ref * (log_ref - log_m)).sum())
-    top1_match = int(p_gen.argmax().item() == p_ref.argmax().item())
+    frame_jsd = (
+        0.5 * (g_aligned * (log_g - log_m)).sum(dim=-1) +
+        0.5 * (r_aligned * (log_r - log_m)).sum(dim=-1)
+    )
+    frame_jsd_mean = float(frame_jsd.mean())
+    dtw = _dtw_jsd(gen_probs, ref_probs)
+    edit_norm = _levenshtein(gen_seq, ref_seq) / max(len(gen_seq), len(ref_seq), 1)
+
+    gen_overall = gen_probs.mean(dim=0)
+    ref_overall = ref_probs.mean(dim=0)
+    top_match = int(gen_overall.argmax().item() == ref_overall.argmax().item())
 
     return {
-        "emo_kl": kl,
-        "emo_jsd": jsd,
-        "emo_top1_match": top1_match,
-        "emo_gen_label": labels[int(p_gen.argmax())],
-        "emo_ref_label": labels[int(p_ref.argmax())],
-        "emo_labels": labels,
-        "emo_gen_probs": [float(x) for x in p_gen.tolist()],
-        "emo_ref_probs": [float(x) for x in p_ref.tolist()],
+        "e2v_dtw_jsd": dtw,
+        "e2v_frame_jsd_mean": frame_jsd_mean,
+        "e2v_label_edit_norm": float(edit_norm),
+        "e2v_top_label_match": top_match,
+        "e2v_classes": list(E2V_CLASSES),
+        "e2v_gen_label_seq": gen_seq,
+        "e2v_ref_label_seq": ref_seq,
+        "e2v_gen_probs_mean": [float(x) for x in gen_overall.tolist()],
+        "e2v_ref_probs_mean": [float(x) for x in ref_overall.tolist()],
     }
 
 
@@ -276,8 +407,9 @@ def evaluate_all(
     """Run all four metrics and merge results into a single dict.
 
     Keys: ``wer`` or ``cer``, ``hyp``, ``ref``, ``utmos``, ``spk_sim``,
-    ``emo_kl``, ``emo_jsd``, ``emo_top1_match``, ``emo_gen_label``,
-    ``emo_ref_label``, ``emo_labels``, ``emo_gen_probs``, ``emo_ref_probs``.
+    ``e2v_dtw_jsd``, ``e2v_frame_jsd_mean``, ``e2v_label_edit_norm``,
+    ``e2v_top_label_match``, ``e2v_classes``, ``e2v_gen_label_seq``,
+    ``e2v_ref_label_seq``, ``e2v_gen_probs_mean``, ``e2v_ref_probs_mean``.
     """
     out: dict = {}
     out.update(compute_wer(gen_wav, gen_text, sr_gen, device=device))
@@ -302,6 +434,7 @@ if __name__ == "__main__":
 
     result = evaluate_all(args.gen, args.ref, args.text, device=args.device)
     if args.short:
-        for k in ("emo_gen_probs", "emo_ref_probs", "emo_labels", "hyp", "ref"):
+        for k in ("e2v_classes", "e2v_gen_label_seq", "e2v_ref_label_seq",
+                  "e2v_gen_probs_mean", "e2v_ref_probs_mean", "hyp", "ref"):
             result.pop(k, None)
     print(json.dumps(result, indent=2, ensure_ascii=False))
