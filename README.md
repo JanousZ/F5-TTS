@@ -386,11 +386,12 @@ python src/f5_tts/infer/eval_metric.py \
 
 # 批量生成 + 自动配对评测 (run_tto.sh)
 
-单次跑：从 `--ref-dir` 随机采 `--batch-size` 条 ref 生成，结束后自动对每条 gen/ref 配对调 `batch_eval.py`，CSV+summary 落到 `tto_outputs/<TAG>/`。TAG 前缀带 `<loss-mode>-<vad-level>`，不同组合互不覆盖。
+单次跑：从 `--ref-dir` 随机采 `--batch-size` 条 ref 生成，结束后自动对每条 gen/ref 配对调 `batch_eval.py`，CSV+summary 落到 `tto_outputs/<TAG>/`。TAG 形如 `<loss>-<vad>_w<ws>_h<hs>_at<oa>_s<steps>_lr<lr>_sm<slide-mode>`，不同组合互不覆盖。
 
 ```bash
-./run_tto.sh                               # 默认: value+frame, w=1.0 h=0.5, 8 条
+./run_tto.sh                               # 默认: value+frame+hidden, w=1.0 h=0.5, 8 条
 ./run_tto.sh --loss-mode embedding --vad-level both --opt-steps 30
+./run_tto.sh --vad-slide-mode audio        # 切回旧的 audio-slide 实现做对照
 ./run_tto.sh --skip-eval                   # 只生成，不评测
 
 # 查看结果
@@ -398,11 +399,17 @@ ls tto_outputs/<TAG>/                      # metrics.csv + metrics.summary.txt +
 cat tto_outputs/*/metrics.summary.txt      # 所有 TAG 聚合统计
 ```
 
-可配置项：`--window-size / --hop-size / --opt-at / --opt-steps / --opt-lr / --loss-mode / --vad-level / --batch-size / --ref-dir`。
+可配置项：`--window-size / --hop-size / --opt-at / --opt-steps / --opt-lr / --loss-mode / --vad-level / --vad-slide-mode / --batch-size / --ref-dir`。
+
+`--vad-slide-mode` 决定 frame 模式下 VAD 怎么提取：
+
+- **`hidden`** (默认): 整段音频一次过 wav2vec2 → `(T, 1024)` hidden state → 在时间轴上滑窗 mean → 分类头。**1 次 backbone forward**，每帧看到完整 attention 上下文，跟训练分布一致。
+- **`audio`** (legacy): 在原始音频上滑窗 → 每窗独立跑整个模型。**N 次 forward**，每帧只看 1 s 局部，OOD 输入。
+- 两种模式产出的 TAG 不同（`_smhidden` / `_smaudio`），可同时存放做对照实验。
 
 # 批量扫参 + 多 GPU 并行 (sweep_tto.sh)
 
-config 行格式：`ws|hs|opt_at|opt_steps|lr|loss_mode|vad_level`，每行调一次 `run_tto.sh`，多卡时按任务队列动态分派。
+config 行格式：`ws|hs|opt_at|opt_steps|lr|loss_mode|vad_level|slide_mode`（8 字段），每行调一次 `run_tto.sh`，多卡时按任务队列动态分派。`slide_mode` 字段缺省时回落 `hidden`，旧的 7 字段 config 仍兼容。
 
 ```bash
 # 单 GPU 串行（原行为）
@@ -429,4 +436,10 @@ config 行格式：`ws|hs|opt_at|opt_steps|lr|loss_mode|vad_level`，每行调�
 for f in tto_outputs/*/metrics.summary.txt; do
   echo "=== $f ==="; grep -E "^(e2v_dtw_jsd|e2v_frame_jsd_mean|e2v_label_edit_norm|e2v_top_label_match|utmos|spk_sim|wer)" "$f"
 done
+
+# 导出结果到csv分析
+python src/f5_tts/infer/aggregate_sweep.py
 ```
+
+初步结论：
+1.在opt_at上，排除late阶段，

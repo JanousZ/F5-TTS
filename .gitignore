@@ -173,3 +173,5 @@ cython_debug/
 *.wav
 experiments/
 asset/
+tto_outputs/
+tto_viz/

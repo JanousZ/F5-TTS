@@ -7,8 +7,9 @@ HOP_SIZE=0.5
 OPT_AT="2,4,6,8,10,12,14,16,18,20,24,28"
 OPT_STEPS=50
 OPT_LR=1e-2
-LOSS_MODE=value    # value | embedding
-VAD_LEVEL=frame    # frame | utter | both
+LOSS_MODE=value          # value | embedding
+VAD_LEVEL=frame          # frame | utter | both
+VAD_SLIDE_MODE=hidden    # hidden (默认: 整段一次 forward + hidden 滑窗) | audio (旧)
 BATCH_SIZE=8
 REF_DIR=asset
 REF_TEXT="Kids are talking by the door. Kids are talking by the door."
@@ -30,6 +31,9 @@ Usage: $0 [options]
   --opt-lr      VAL   (default: ${OPT_LR})
   --loss-mode   STR   value|embedding (default: ${LOSS_MODE})
   --vad-level   STR   frame|utter|both (default: ${VAD_LEVEL})
+  --vad-slide-mode STR  hidden|audio (default: ${VAD_SLIDE_MODE})
+                  hidden = single backbone forward + slide on hidden state
+                  audio  = legacy: per-window wav2vec2 forward (slower, OOD)
   --batch-size  INT   (default: ${BATCH_SIZE})
   --ref-dir     DIR   (default: ${REF_DIR})
   --skip-eval         skip post-generation batch eval
@@ -44,8 +48,9 @@ while [[ $# -gt 0 ]]; do
     --opt-at)      OPT_AT="$2";      shift 2 ;;
     --opt-steps)   OPT_STEPS="$2";   shift 2 ;;
     --opt-lr)      OPT_LR="$2";      shift 2 ;;
-    --loss-mode)   LOSS_MODE="$2";   shift 2 ;;
-    --vad-level)   VAD_LEVEL="$2";   shift 2 ;;
+    --loss-mode)      LOSS_MODE="$2";       shift 2 ;;
+    --vad-level)      VAD_LEVEL="$2";       shift 2 ;;
+    --vad-slide-mode) VAD_SLIDE_MODE="$2";  shift 2 ;;
     --batch-size)  BATCH_SIZE="$2";  shift 2 ;;
     --ref-dir)     REF_DIR="$2";     shift 2 ;;
     --skip-eval)   SKIP_EVAL=1;      shift ;;
@@ -56,8 +61,9 @@ done
 
 OPT_AT_SLUG="${OPT_AT//,/-}"
 # TAG prefixes loss-mode + vad-level so different loss configurations land in
-# sibling directories instead of overwriting each other.
-TAG="${LOSS_MODE}-${VAD_LEVEL}_w${WINDOW_SIZE}_h${HOP_SIZE}_at${OPT_AT_SLUG}_s${OPT_STEPS}_lr${OPT_LR}"
+# sibling directories instead of overwriting each other. _sm<mode> suffix
+# distinguishes audio-slide vs hidden-slide implementations.
+TAG="${LOSS_MODE}-${VAD_LEVEL}_w${WINDOW_SIZE}_h${HOP_SIZE}_at${OPT_AT_SLUG}_s${OPT_STEPS}_lr${OPT_LR}_sm${VAD_SLIDE_MODE}"
 
 cd "$(dirname "$0")"
 
@@ -76,6 +82,7 @@ python src/f5_tts/infer/tto.py \
   --loss-mode "${LOSS_MODE}" \
   --opt-at "${OPT_AT}" --opt-steps "${OPT_STEPS}" --opt-lr "${OPT_LR}" \
   --vad-level "${VAD_LEVEL}" \
+  --vad-slide-mode "${VAD_SLIDE_MODE}" \
   --window-size "${WINDOW_SIZE}" --hop-size "${HOP_SIZE}" \
   --batch-size "${BATCH_SIZE}" \
   --ref-dir "${REF_DIR}" \

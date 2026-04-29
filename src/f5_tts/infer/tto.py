@@ -39,6 +39,9 @@ from f5_tts.model.utils import (
 
 _VAD_MODEL_NAME = '/mnt/disk1/models/wav2vec2-large-robust-12-ft-emotion-msp-dim'
 _VAD_SR = 16000
+# wav2vec2-large 的 conv stack 总 stride = 320，输入 16 kHz → 输出 ~50 fps
+# (20 ms / frame)。hidden-mode 滑窗用这个把秒数换算成 frame 数。
+_VAD_FRAME_HZ = 50
 
 
 class _RegressionHead(nn.Module):
@@ -71,13 +74,21 @@ class _EmotionModel(Wav2Vec2PreTrainedModel):
 
 
 class GradVADExtractor(nn.Module):
-    """Differentiable counterpart of ``VAD_extractor.process_func_framewise``.
+    """Differentiable VAD extractor over ``wav2vec2-large-robust-12-ft-emotion-msp-dim``.
 
-    Shares weights with ``audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim``
-    (frozen). Accepts a waveform tensor at ``in_sr`` Hz, resamples to 16 kHz,
-    applies zero-mean / unit-var normalization, and extracts frame-level
-    features with a sliding window. Gradients flow through the pipeline back
-    to the input waveform.
+    Frozen backbone; gradients flow back to input wav. Two implementations
+    selectable via ``slide_mode``:
+
+      ``audio`` (legacy): unfold raw 16 kHz audio into windows, run the FULL
+        model (wav2vec2 + mean + classifier) on EACH window. Each frame's
+        attention only sees its own ~1 s chunk → out-of-distribution input
+        for the classifier (which was trained on whole utterances), and N×
+        backbone forwards.
+
+      ``hidden`` (default, recommended): one wav2vec2 forward over the full
+        audio → ``(T_frame, 1024)`` hidden state → unfold over the time axis
+        → mean per window → classifier per window. Frames see the full
+        attention context (in-distribution), and only one backbone forward.
     """
 
     def __init__(
@@ -85,8 +96,12 @@ class GradVADExtractor(nn.Module):
         in_sr: int = 24000,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
+        slide_mode: str = "hidden",
     ):
         super().__init__()
+        if slide_mode not in ("audio", "hidden"):
+            raise ValueError(f"slide_mode must be 'audio' or 'hidden', got {slide_mode!r}")
+        self.slide_mode = slide_mode
         self.in_sr = in_sr
         self._processor = Wav2Vec2FeatureExtractor.from_pretrained(_VAD_MODEL_NAME)
         with open(os.path.join(_VAD_MODEL_NAME, 'config.json')) as f:
@@ -168,6 +183,27 @@ class GradVADExtractor(nn.Module):
             feat = (pooled if embeddings else logits).unsqueeze(1)  # (B, 1, D)
             return feat.squeeze(0) if squeeze_batch else feat
 
+        if self.slide_mode == "audio":
+            emb, val = self._frame_features_audio_slide(
+                wav, window_size=window_size, hop_size=hop_size, pad=pad,
+            )
+        else:  # "hidden"
+            emb, val = self._frame_features_hidden_slide(
+                wav, window_size=window_size, hop_size=hop_size, pad=pad,
+            )
+        if return_both:
+            if squeeze_batch:
+                emb, val = emb.squeeze(0), val.squeeze(0)
+            return emb, val
+        feat = emb if embeddings else val
+        return feat.squeeze(0) if squeeze_batch else feat
+
+    # ---- internal helpers ------------------------------------------------
+
+    def _frame_features_audio_slide(
+        self, wav: torch.Tensor, *, window_size: float, hop_size: float, pad: bool,
+    ):
+        """Legacy: unfold raw audio into windows, run full model on each."""
         win = int(round(window_size * _VAD_SR))
         hop = int(round(hop_size * _VAD_SR))
         if win <= 0 or hop <= 0:
@@ -192,15 +228,42 @@ class GradVADExtractor(nn.Module):
         frames = frames.to(next(self.model.parameters()).dtype)
 
         pooled, logits = self.model(frames)
-        if return_both:
-            emb = pooled.view(B, num_frames, -1)
-            val = logits.view(B, num_frames, -1)
-            if squeeze_batch:
-                emb, val = emb.squeeze(0), val.squeeze(0)
-            return emb, val
-        feat = pooled if embeddings else logits
-        feat = feat.view(B, num_frames, -1)
-        return feat.squeeze(0) if squeeze_batch else feat
+        emb = pooled.view(B, num_frames, -1)
+        val = logits.view(B, num_frames, -1)
+        return emb, val
+
+    def _frame_features_hidden_slide(
+        self, wav: torch.Tensor, *, window_size: float, hop_size: float, pad: bool,
+    ):
+        """One backbone forward over full audio, then slide window on hidden."""
+        signal = self._normalize(wav) if self.do_normalize else wav
+        signal = signal.to(next(self.model.parameters()).dtype)
+        # Skip the model's own mean+classifier — we'll do mean-per-window then
+        # apply classifier ourselves. This keeps the gradient path short.
+        hidden = self.model.wav2vec2(signal)[0]    # (B, T_frame, D)
+        B, T_frame, D = hidden.shape
+
+        win = max(1, int(round(window_size * _VAD_FRAME_HZ)))
+        hop = max(1, int(round(hop_size * _VAD_FRAME_HZ)))
+
+        if T_frame < win:
+            if not pad:
+                raise ValueError(f"hidden frames ({T_frame}) shorter than win ({win})")
+            pooled = hidden.mean(dim=1, keepdim=True)        # (B, 1, D)
+        else:
+            if pad:
+                rem = (T_frame - win) % hop
+                if rem != 0:
+                    pad_n = hop - rem
+                    hidden = F.pad(hidden, (0, 0, 0, pad_n))  # pad time axis
+            windows = hidden.unfold(1, win, hop)              # (B, n_win, D, win)
+            pooled = windows.mean(dim=-1)                     # (B, n_win, D)
+
+        n_win = pooled.shape[1]
+        logits = self.model.classifier(
+            pooled.reshape(B * n_win, D)
+        ).view(B, n_win, -1)                                  # (B, n_win, 3)
+        return pooled, logits
 
 
 @torch.no_grad()
@@ -845,6 +908,12 @@ if __name__ == "__main__":
              "(utterance-level MSE, mirrors VAD_extractor.process_func), or "
              "'both' (frame + utter).",
     )
+    parser.add_argument(
+        "--vad-slide-mode", choices=("audio", "hidden"), default="hidden",
+        help="frame 模式下滑窗的实现: 'audio' 在原始音频上切窗(每窗独立 wav2vec2 "
+             "forward, OOD 输入); 'hidden' 整段音频一次 forward 拿 hidden state, "
+             "再在时间轴上滑窗(默认, in-distribution + 快几倍).",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output", default="tto_demo.wav",
                         help="单条: 输出文件路径; 批量: 输出目录")
@@ -897,7 +966,10 @@ if __name__ == "__main__":
         vocoder_local_path=args.vocoder_local_path or None,
     )
     device = tts.device
-    vad = GradVADExtractor(in_sr=target_sample_rate, device=device)
+    vad = GradVADExtractor(
+        in_sr=target_sample_rate, device=device,
+        slide_mode=args.vad_slide_mode,
+    )
     opt_schedule = [int(s) for s in args.opt_at.split(",") if s.strip()]
 
     def _run_one(ref_audio_path: str, out_path: str, viz_base: str | None) -> None:

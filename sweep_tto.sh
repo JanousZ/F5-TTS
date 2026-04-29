@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Each row: window_size|hop_size|opt_at|opt_steps|opt_lr|loss_mode|vad_level
-#   loss_mode: value | embedding
-#   vad_level: frame | utter | both
+# Each row: window_size|hop_size|opt_at|opt_steps|opt_lr|loss_mode|vad_level|slide_mode
+#   loss_mode  : value | embedding
+#   vad_level  : frame | utter | both
+#   slide_mode : hidden (default, 1× backbone forward + slide on hidden)
+#                audio  (legacy: per-window wav2vec2, slower & OOD)
 # Each row runs tto generation + batch eval into a TAG-named folder, so
-# different (loss_mode, vad_level, hop/window) combinations never clobber.
+# different combinations never clobber. The TAG suffix _sm<mode> distinguishes
+# slide_mode runs explicitly.
 configs=(
-  # --- Phase 1: loss-mode × vad-level (single window/hop) ---
-  "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|frame"
-  "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|utter"
-  "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|both"
-  "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|embedding|frame"
-  "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|embedding|utter"
-  "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|embedding|both"
+  # --- A/B comparison: hidden vs audio at a known-good config ---
+  "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|250|1e-3|value|frame|hidden"
+  "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|250|1e-3|value|frame|audio"
 
-  # --- (optional) window/hop sweep at the Phase-1 winner ---
-  # "1.5|1.0|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|frame"
-  # "0.5|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|frame"
+  # --- Phase 1 (when ready): loss-mode × vad-level under hidden slide ---
+  # "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|frame|hidden"
+  # "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|utter|hidden"
+  # "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|both|hidden"
+  # "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|embedding|frame|hidden"
+  # "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|embedding|utter|hidden"
+  # "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|embedding|both|hidden"
 )
 
 GPUS="0"
@@ -97,16 +100,18 @@ trap 'echo; echo "[sweep] interrupted — killing children"; \
       done; wait; exit 130' INT TERM
 
 cfg_to_tag() {
-  local cfg="$1" ws hs oa os lr lm vl
-  IFS='|' read -r ws hs oa os lr lm vl <<< "$cfg"
+  local cfg="$1" ws hs oa os lr lm vl sm
+  IFS='|' read -r ws hs oa os lr lm vl sm <<< "$cfg"
+  sm="${sm:-hidden}"   # backwards compat for older 7-field rows
   local oa_slug="${oa//,/-}"
-  echo "${lm}-${vl}_w${ws}_h${hs}_at${oa_slug}_s${os}_lr${lr}"
+  echo "${lm}-${vl}_w${ws}_h${hs}_at${oa_slug}_s${os}_lr${lr}_sm${sm}"
 }
 
 launch() {
   local gpu="$1" idx="$2" cfg="$3"
-  local ws hs oa os lr lm vl
-  IFS='|' read -r ws hs oa os lr lm vl <<< "$cfg"
+  local ws hs oa os lr lm vl sm
+  IFS='|' read -r ws hs oa os lr lm vl sm <<< "$cfg"
+  sm="${sm:-hidden}"
   local tag; tag=$(cfg_to_tag "$cfg")
   local log="${LOG_DIR}/${idx}_gpu${gpu}_${tag}.log"
   local extra_args=()
@@ -114,14 +119,14 @@ launch() {
 
   CUDA_VISIBLE_DEVICES="$gpu" ./run_tto.sh \
     "${extra_args[@]}" \
-    --loss-mode "$lm" --vad-level "$vl" \
+    --loss-mode "$lm" --vad-level "$vl" --vad-slide-mode "$sm" \
     --window-size "$ws" --hop-size "$hs" \
     --opt-at "$oa" --opt-steps "$os" --opt-lr "$lr" \
     >"$log" 2>&1 &
   local pid=$!
   gpu_pid[$gpu]=$pid
   pid_info[$pid]="gpu=${gpu} idx=${idx}/${total} tag=${tag}"
-  echo "[dispatch] $(date +%H:%M:%S)  gpu=${gpu} pid=${pid}  [$idx/$total] ${lm}-${vl} ws=${ws} hs=${hs}  → ${log}"
+  echo "[dispatch] $(date +%H:%M:%S)  gpu=${gpu} pid=${pid}  [$idx/$total] ${lm}-${vl}-${sm} ws=${ws} hs=${hs}  → ${log}"
 }
 
 # Find a GPU whose previous job has exited; block (poll) until one is free.
