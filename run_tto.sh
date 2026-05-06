@@ -10,7 +10,7 @@ OPT_LR=1e-2
 LOSS_MODE=value          # value | embedding
 VAD_LEVEL=frame          # frame | utter | both
 VAD_SLIDE_MODE=hidden    # hidden (默认: 整段一次 forward + hidden 滑窗) | audio (旧)
-BATCH_SIZE=8
+BATCH_SIZE=1
 REF_DIR=asset
 REF_TEXT="Kids are talking by the door. Kids are talking by the door."
 GEN_TEXT="Dogs are walking on the floor. Dogs are walking on the floor."
@@ -98,7 +98,7 @@ echo
 echo "=========================================================="
 echo "[run_tto] batch eval: ${OUT_DIR}  vs  ${REF_DIR}"
 echo "=========================================================="
-python src/f5_tts/infer/batch_eval.py \
+python src/f5_tts/eval/batch_eval.py \
   --gen-dir "${OUT_DIR}" \
   --ref-dir "${REF_DIR}" \
   --gen-text "${GEN_TEXT}" \

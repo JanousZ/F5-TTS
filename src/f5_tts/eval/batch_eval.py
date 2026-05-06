@@ -20,15 +20,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from f5_tts.infer.eval_metric import evaluate_all
+from f5_tts.eval.eval_metric import evaluate_all
 
 
 SCALAR_COLS = ["wer", "cer", "utmos", "spk_sim",
-               "e2v_dtw_jsd", "e2v_frame_jsd_mean",
-               "e2v_label_edit_norm", "e2v_top_label_match"]
+               "e2v_sim_utt", "e2v_sim_frame",
+               "av_sim_utt", "av_sim_chunk"]
 # Lists are serialized to ';'-joined strings before write (see _csv_serialize).
-STR_COLS = ["e2v_gen_label_seq", "e2v_ref_label_seq",
-            "e2v_gen_probs_mean", "e2v_ref_probs_mean", "hyp"]
+STR_COLS = ["hyp"]
 
 
 def _csv_serialize(v):
@@ -77,7 +76,9 @@ def main() -> int:
         text_metric = "wer" if "wer" in r else "cer"
         print(f"[{i:02d}/{len(gen_paths)}] {gp.stem:30s}  "
               f"{text_metric}={r[text_metric]:.3f}  utmos={r['utmos']:.2f}  "
-              f"spk={r['spk_sim']:.3f}  e2v_dtw={r['e2v_dtw_jsd']:.3f}  "
+              f"spk={r['spk_sim']:.3f}  e2v_utt={r['e2v_sim_utt']:.3f}  "
+              f"e2v_frm={r['e2v_sim_frame']:.3f}  "
+              f"av_utt={r['av_sim_utt']:.3f}  av_chk={r['av_sim_chunk']:.3f}  "
               f"[{dt:.1f}s]")
 
     if not rows:

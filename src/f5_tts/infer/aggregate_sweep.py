@@ -33,8 +33,8 @@ TAG_RE = re.compile(
 # Order of metric columns in the CSV (mean / std / min / max all kept).
 METRIC_ORDER = (
     "wer", "cer", "utmos", "spk_sim",
-    "e2v_dtw_jsd", "e2v_frame_jsd_mean",
-    "e2v_label_edit_norm", "e2v_top_label_match",
+    "e2v_sim_utt", "e2v_sim_frame",
+    "av_sim_utt", "av_sim_chunk",
 )
 
 

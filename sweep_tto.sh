@@ -11,8 +11,8 @@ set -euo pipefail
 # slide_mode runs explicitly.
 configs=(
   # --- A/B comparison: hidden vs audio at a known-good config ---
-  "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|250|1e-3|value|frame|hidden"
-  "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|250|1e-3|value|frame|audio"
+  "0.5|0.25|2,4,6,8,10,12,14|50|1e-2|embedding|both|hidden"
+  "1.0|0.25||50|1e-2|value|frame|audio"
 
   # --- Phase 1 (when ready): loss-mode × vad-level under hidden slide ---
   # "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|frame|hidden"
@@ -198,7 +198,7 @@ if [[ $DEFER_EVAL -eq 1 ]]; then
       echo "[eval] SKIP ${out_dir} (no wav)"; eval_fail=$((eval_fail+1)); continue
     fi
     echo "[eval] >>> ${tag}"
-    CUDA_VISIBLE_DEVICES="$eval_gpu" python src/f5_tts/infer/batch_eval.py \
+    CUDA_VISIBLE_DEVICES="$eval_gpu" python src/f5_tts/eval/batch_eval.py \
       --gen-dir "$out_dir" \
       --ref-dir "$REF_DIR" \
       --gen-text "$GEN_TEXT" \

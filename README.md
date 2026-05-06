@@ -329,7 +329,7 @@ RAVDESS/
 python emotion_concat.py \
   --actor 06 \
   --emotion1 03 --intensity1 02 \
-  --emotion2 05 --intensity2 02 \
+  --emotion2 07 --intensity2 02 \
   --output_dir asset
 
 python emotion_concat.py \
@@ -379,7 +379,7 @@ python src/f5_tts/infer/aggregate_budget_sweep.py \
   --run-dir experiments/budget_sweep/20260422_042004
 
 #指标检测
-python src/f5_tts/infer/eval_metric.py \
+python src/f5_tts/eval/eval_metric.py \
   --ref ./asset/actor01_angry-strong_to_surprised-strong.wav \
   --gen ./asset/actor01_happy-strong_to_sad-strong.wav \
   --text "Some call me nature, others call me mother nature."
@@ -434,12 +434,25 @@ config 行格式：`ws|hs|opt_at|opt_steps|lr|loss_mode|vad_level|slide_mode`（
 
 ```bash
 for f in tto_outputs/*/metrics.summary.txt; do
-  echo "=== $f ==="; grep -E "^(e2v_dtw_jsd|e2v_frame_jsd_mean|e2v_label_edit_norm|e2v_top_label_match|utmos|spk_sim|wer)" "$f"
+  echo "=== $f ==="; grep -E "^(e2v_sim_utt|e2v_sim_frame|av_sim_utt|av_sim_chunk|utmos|spk_sim|wer|cer)" "$f"
 done
 
 # 导出结果到csv分析
 python src/f5_tts/infer/aggregate_sweep.py
 ```
 
-初步结论：
-1.在opt_at上，排除late阶段，
+# tto -> text_tto
+
+python src/f5_tts/infer/text_VAD.py \
+    --text "I am extremely happy today, but tomorrow will be sad" \
+    --n-win 30 --weight-mode chars
+
+单条：
+python src/f5_tts/infer/text_tto.py \
+    --gen-text "I am very happy today" \
+    --opt-at 16,24 --opt-steps 5 --opt-lr 5e-3 \
+    --output /tmp/test.wav
+
+python src/f5_tts/infer/text_tto.py \
+    --text-vad-scale 0.2,0.9 \
+    ...
