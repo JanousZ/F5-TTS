@@ -384,6 +384,22 @@ python src/f5_tts/eval/eval_metric.py \
   --gen ./asset/actor01_happy-strong_to_sad-strong.wav \
   --text "Some call me nature, others call me mother nature."
 
+TAG=value-frame_w1.0_h0.25_at2-4-6-8-10-12-14_s50_lr1e-2_smhidden
+CUDA_VISIBLE_DEVICES=2 python src/f5_tts/eval/batch_eval.py \
+  --gen-dir tto_outputs/$TAG \
+  --ref-dir asset \
+  --gen-text "Dogs are sitting by the door. Dogs are sitting by the door." \
+  --out-csv tto_outputs/$TAG/metrics.csv
+
+for d in tto_outputs/*/; do
+  [ -f "$d/metrics.csv" ] || continue
+  CUDA_VISIBLE_DEVICES=2 python src/f5_tts/eval/batch_eval.py \
+    --gen-dir "$d" \
+    --ref-dir asset \
+    --gen-text "Dogs are sitting by the door. Dogs are sitting by the door." \
+    --out-csv "$d/metrics.csv"
+done
+
 # 批量生成 + 自动配对评测 (run_tto.sh)
 
 单次跑：从 `--ref-dir` 随机采 `--batch-size` 条 ref 生成，结束后自动对每条 gen/ref 配对调 `batch_eval.py`，CSV+summary 落到 `tto_outputs/<TAG>/`。TAG 形如 `<loss>-<vad>_w<ws>_h<hs>_at<oa>_s<steps>_lr<lr>_sm<slide-mode>`，不同组合互不覆盖。
@@ -434,7 +450,7 @@ config 行格式：`ws|hs|opt_at|opt_steps|lr|loss_mode|vad_level|slide_mode`（
 
 ```bash
 for f in tto_outputs/*/metrics.summary.txt; do
-  echo "=== $f ==="; grep -E "^(e2v_sim_utt|e2v_sim_frame|av_sim_utt|av_sim_chunk|utmos|spk_sim|wer|cer)" "$f"
+  echo "=== $f ==="; grep -E "^(spk_sim|e2v_sim_utt|e2v_sim_frame|av_sim_utt|av_sim_chunk|utmos|spk_sim|wer|cer)" "$f"
 done
 
 # 导出结果到csv分析

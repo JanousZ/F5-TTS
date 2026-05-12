@@ -25,7 +25,7 @@ from f5_tts.eval.eval_metric import evaluate_all
 
 SCALAR_COLS = ["wer", "cer", "utmos", "spk_sim",
                "e2v_sim_utt", "e2v_sim_frame",
-               "av_sim_utt", "av_sim_chunk"]
+               "av_sim_utt", "av_sim_chunk", "pcp_score"]
 # Lists are serialized to ';'-joined strings before write (see _csv_serialize).
 STR_COLS = ["hyp"]
 
@@ -79,7 +79,7 @@ def main() -> int:
               f"spk={r['spk_sim']:.3f}  e2v_utt={r['e2v_sim_utt']:.3f}  "
               f"e2v_frm={r['e2v_sim_frame']:.3f}  "
               f"av_utt={r['av_sim_utt']:.3f}  av_chk={r['av_sim_chunk']:.3f}  "
-              f"[{dt:.1f}s]")
+              f"pcp={r['pcp_score']:.2f}  [{dt:.1f}s]")
 
     if not rows:
         print("[batch_eval] no pairs evaluated", file=sys.stderr)

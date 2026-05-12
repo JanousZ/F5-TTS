@@ -35,6 +35,7 @@ METRIC_ORDER = (
     "wer", "cer", "utmos", "spk_sim",
     "e2v_sim_utt", "e2v_sim_frame",
     "av_sim_utt", "av_sim_chunk",
+    "pcp_score",
 )
 
 
