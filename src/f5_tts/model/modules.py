@@ -434,11 +434,14 @@ class Attention(nn.Module):
         rope=None,  # rotary position embedding for x
         c_rope=None,  # rotary position embedding for c
         c_mask: bool["b nt"] | None = None,  # text mask
+        block_mask: bool["b n n"] | None = None,  # full (N, N) attn mask, single-stream only
     ) -> torch.Tensor:
         if c is not None:
+            if block_mask is not None:
+                raise NotImplementedError("block_mask is not supported with joint attention (MM-DiT).")
             return self.processor(self, x, c=c, mask=mask, rope=rope, c_rope=c_rope, c_mask=c_mask)
         else:
-            return self.processor(self, x, mask=mask, rope=rope)
+            return self.processor(self, x, mask=mask, rope=rope, block_mask=block_mask)
 
 
 # Attention processor
@@ -474,6 +477,7 @@ class AttnProcessor:
         x: float["b n d"],  # noised input x
         mask: bool["b n"] | None = None,
         rope=None,  # rotary position embedding
+        block_mask: bool["b n n"] | None = None,
     ) -> torch.FloatTensor:
         batch_size = x.shape[0]
 
@@ -509,8 +513,27 @@ class AttnProcessor:
                 key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
 
         if self.attn_backend == "torch":
-            # mask. e.g. inference got a batch with different target durations, mask out the padding
-            if self.attn_mask_enabled and mask is not None:
+            # mask. e.g. inference got a batch with different target durations, mask out the padding.
+            # If block_mask is provided (segmented attention), use it directly as the attention mask
+            # and broadcast over heads. `mask` (2D) is still used for the final output zero-fill.
+            if block_mask is not None:
+                if block_mask.ndim == 2:
+                    block_mask = block_mask.unsqueeze(0)
+                if block_mask.ndim != 3:
+                    raise ValueError("block_mask must have shape (N, N) or (B, N, N)")
+                if block_mask.shape[0] == 1 and batch_size > 1:
+                    block_mask = block_mask.expand(batch_size, -1, -1)
+                if block_mask.shape[0] != batch_size:
+                    raise ValueError("block_mask batch size must match x batch size")
+                if block_mask.shape[-2:] != (query.shape[-2], key.shape[-2]):
+                    raise ValueError(
+                        "block_mask shape must match attention sequence length, "
+                        f"got {tuple(block_mask.shape[-2:])} for {(query.shape[-2], key.shape[-2])}"
+                    )
+                if mask is not None:
+                    block_mask = block_mask & mask.unsqueeze(1) & mask.unsqueeze(2)
+                attn_mask = block_mask.unsqueeze(1)  # 'b n n -> b 1 n n', sdpa broadcasts on heads
+            elif self.attn_mask_enabled and mask is not None:
                 attn_mask = mask
                 attn_mask = attn_mask.unsqueeze(1).unsqueeze(1)  # 'b n -> b 1 1 n'
                 attn_mask = attn_mask.expand(batch_size, attn.heads, query.shape[-2], key.shape[-2])
@@ -520,6 +543,11 @@ class AttnProcessor:
             x = x.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
 
         elif self.attn_backend == "flash_attn":
+            if block_mask is not None:
+                raise NotImplementedError(
+                    "block_mask (segmented attention) requires attn_backend='torch'; "
+                    "flash_attn only supports causal / varlen-padding masks."
+                )
             query = query.transpose(1, 2)  # [b, h, n, d] -> [b, n, h, d]
             key = key.transpose(1, 2)
             value = value.transpose(1, 2)
@@ -740,12 +768,12 @@ class DiTBlock(nn.Module):
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
 
-    def forward(self, x, t, mask=None, rope=None):  # x: noised input, t: time embedding
+    def forward(self, x, t, mask=None, rope=None, block_mask=None):  # x: noised input, t: time embedding
         # pre-norm & modulation for attention input
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
 
         # attention
-        attn_output = self.attn(x=norm, mask=mask, rope=rope)
+        attn_output = self.attn(x=norm, mask=mask, rope=rope, block_mask=block_mask)
 
         # process attention output for input x
         x = x + gate_msa.unsqueeze(1) * attn_output
