@@ -99,6 +99,7 @@ class CFM(nn.Module):
         duplicate_test=False,
         t_inter=0.1,
         edit_mask=None,
+        attn_block_mask=None,
     ):
         self.eval()
         # raw wave
@@ -152,10 +153,29 @@ class CFM(nn.Module):
             cond_mask, cond, torch.zeros_like(cond)
         )  # allow direct control (cut cond audio) with lens passed in
 
-        if batch > 1:
-            mask = lens_to_mask(duration)
+        valid_mask = lens_to_mask(duration)
+        if batch > 1 or attn_block_mask is not None:
+            mask = valid_mask
         else:  # save memory and speed up, as single inference need no mask currently
             mask = None
+        if attn_block_mask is not None:
+            attn_block_mask = attn_block_mask.to(device=device, dtype=torch.bool)
+            if attn_block_mask.ndim == 2:
+                attn_block_mask = attn_block_mask.unsqueeze(0)
+            if attn_block_mask.ndim != 3:
+                raise ValueError("attn_block_mask must have shape (N, N) or (B, N, N)")
+            if attn_block_mask.shape[0] == 1 and batch > 1:
+                attn_block_mask = attn_block_mask.expand(batch, -1, -1).clone()
+            if attn_block_mask.shape[0] != batch:
+                raise ValueError("attn_block_mask batch size must match cond batch size")
+            if attn_block_mask.shape[-2:] != (int(max_duration.item()), int(max_duration.item())):
+                raise ValueError(
+                    "attn_block_mask shape must match final duration "
+                    f"({int(max_duration.item())}, {int(max_duration.item())}), "
+                    f"got {tuple(attn_block_mask.shape[-2:])}"
+                )
+            attn_block_mask = attn_block_mask & valid_mask.unsqueeze(1) & valid_mask.unsqueeze(2)
+        attn_kwargs = {"attn_block_mask": attn_block_mask} if attn_block_mask is not None else {}
 
         # neural ode
 
@@ -174,6 +194,7 @@ class CFM(nn.Module):
                     drop_audio_cond=False,
                     drop_text=False,
                     cache=True,
+                    **attn_kwargs,
                 )
                 return pred
 
@@ -186,6 +207,7 @@ class CFM(nn.Module):
                 mask=mask,
                 cfg_infer=True,
                 cache=True,
+                **attn_kwargs,
             )
             pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
             return pred + (pred - null_pred) * cfg_strength
