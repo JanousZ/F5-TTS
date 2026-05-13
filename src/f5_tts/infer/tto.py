@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -29,6 +29,7 @@ from transformers.models.wav2vec2.modeling_wav2vec2 import (
 )
 
 from f5_tts.model.utils import (
+    convert_char_to_pinyin,
     exists,
     get_epss_timesteps,
     lens_to_mask,
@@ -391,6 +392,181 @@ def _align_frames(
     return _interp(gen), _interp(ref)
 
 
+def build_segmented_attn_mask(
+    ref_lens: Sequence[int] | torch.Tensor,
+    gen_lens: Sequence[int] | torch.Tensor,
+    *,
+    device: torch.device | str | None = None,
+    batch_size: int | None = None,
+    gen_visible_text_prefix_len: int | None = None,
+) -> torch.Tensor:
+    """Build a grouped-layout block attention mask for segmented inference.
+
+    Sequence layout is ``[ref_1 ... ref_N, gen_1 ... gen_N]``. Reference
+    segments can see all reference segments, plus their paired generation
+    segment; all generation segments can see each other and their paired
+    reference segment. Optionally, generation queries can also see a global
+    prefix range ``[:gen_visible_text_prefix_len]``.
+    """
+    if torch.is_tensor(ref_lens):
+        ref_lens_list = [int(x) for x in ref_lens.detach().cpu().tolist()]
+    else:
+        ref_lens_list = [int(x) for x in ref_lens]
+    if torch.is_tensor(gen_lens):
+        gen_lens_list = [int(x) for x in gen_lens.detach().cpu().tolist()]
+    else:
+        gen_lens_list = [int(x) for x in gen_lens]
+
+    if len(ref_lens_list) != len(gen_lens_list):
+        raise ValueError("ref_lens and gen_lens must have the same number of segments")
+    if not ref_lens_list:
+        raise ValueError("at least one segment is required")
+    if any(x <= 0 for x in ref_lens_list + gen_lens_list):
+        raise ValueError("all segment lengths must be positive")
+
+    ref_total = sum(ref_lens_list)
+    gen_total = sum(gen_lens_list)
+    total = ref_total + gen_total
+    mask = torch.zeros((total, total), device=device, dtype=torch.bool)
+
+    gen_start = ref_total
+    # Relaxed mode: allow full reference-reference interactions.
+    mask[:gen_start, :gen_start] = True
+    mask[gen_start:, gen_start:] = True
+
+    r0 = 0
+    g0 = gen_start
+    for r_len, g_len in zip(ref_lens_list, gen_lens_list):
+        r1 = r0 + r_len
+        g1 = g0 + g_len
+
+        mask[r0:r1, g0:g1] = True
+        mask[g0:g1, r0:r1] = True
+
+        r0 = r1
+        g0 = g1
+
+    if gen_visible_text_prefix_len is not None:
+        p = max(0, min(int(gen_visible_text_prefix_len), total))
+        if p > 0:
+            # Directional relaxation: generation queries can attend to the
+            # global text-valid prefix on the audio frame axis.
+            mask[gen_start:, :p] = True
+
+    if batch_size is not None:
+        mask = mask.unsqueeze(0).expand(int(batch_size), -1, -1).clone()
+    return mask
+
+
+def build_segmented_text_tokens(
+    cfm,
+    ref_texts: Sequence[str],
+    gen_texts: Sequence[str],
+    ref_lens: Sequence[int] | torch.Tensor,
+    gen_lens: Sequence[int] | torch.Tensor,
+    *,
+    device: torch.device | str | None = None,
+    convert_to_pinyin: bool = True,
+) -> tuple[torch.Tensor, int]:
+    """Tokenize one concatenated text sequence and pad once to total length."""
+    ref_lens_list = [int(x) for x in (ref_lens.detach().cpu().tolist() if torch.is_tensor(ref_lens) else ref_lens)]
+    gen_lens_list = [int(x) for x in (gen_lens.detach().cpu().tolist() if torch.is_tensor(gen_lens) else gen_lens)]
+    if len(ref_texts) != len(gen_texts) or len(ref_texts) != len(ref_lens_list):
+        raise ValueError("ref_texts, gen_texts, ref_lens and gen_lens must have the same segment count")
+    total_len = sum(ref_lens_list) + sum(gen_lens_list)
+    merged_text = "".join(list(ref_texts) + list(gen_texts))
+    texts = [merged_text]
+    if convert_to_pinyin:
+        texts = convert_char_to_pinyin(texts)
+    if exists(cfm.vocab_char_map):
+        token = list_str_to_idx(texts, cfm.vocab_char_map)[0]
+    else:
+        token = list_str_to_tensor(texts)[0]
+
+    valid = token[token != -1][:total_len]
+    valid_len = int(valid.shape[0])
+    if valid_len < total_len:
+        valid = F.pad(valid, (0, total_len - valid_len), value=-1)
+    return valid.unsqueeze(0).to(device), valid_len
+
+
+def prepare_segmented_tto_inputs(
+    cfm,
+    ref_wavs: Sequence[torch.Tensor],
+    ref_texts: Sequence[str],
+    gen_texts: Sequence[str],
+    *,
+    gen_durations: Sequence[int] | torch.Tensor | None = None,
+    speed: float = 1.0,
+    device: torch.device | str | None = None,
+    convert_to_pinyin: bool = True,
+) -> dict[str, torch.Tensor | list[int]]:
+    """Prepare ``cond``, ``text``, ``duration`` and block mask for segmented TTO.
+
+    ``ref_wavs`` are expected to be mono waveforms already resampled/RMS-scaled
+    for the CFM path. The returned sequence layout is grouped as
+    ``[ref_1 ... ref_N, gen_1 ... gen_N]``.
+    """
+    if len(ref_wavs) != len(ref_texts) or len(ref_wavs) != len(gen_texts):
+        raise ValueError("ref_wavs, ref_texts and gen_texts must have the same segment count")
+    if speed <= 0:
+        raise ValueError("speed must be positive")
+    if device is None:
+        device = next(cfm.parameters()).device
+
+    ref_mels = []
+    ref_lens: list[int] = []
+    for wav in ref_wavs:
+        if wav.ndim == 1:
+            wav = wav.unsqueeze(0)
+        if wav.ndim != 2:
+            raise ValueError("each ref wav must have shape (T,) or (1, T)")
+        mel = cfm.mel_spec(wav.to(device)).permute(0, 2, 1)
+        if mel.shape[0] != 1:
+            raise ValueError("prepare_segmented_tto_inputs currently expects mono/single-item ref wavs")
+        ref_mels.append(mel.squeeze(0))
+        ref_lens.append(int(mel.shape[1]))
+
+    if gen_durations is None:
+        gen_lens = []
+        for r_len, r_text, g_text in zip(ref_lens, ref_texts, gen_texts):
+            ref_text_len = max(len(r_text.encode("utf-8")), 1)
+            gen_text_len = max(len(g_text.encode("utf-8")), 1)
+            gen_lens.append(max(1, int(r_len / ref_text_len * gen_text_len / speed)))
+    elif torch.is_tensor(gen_durations):
+        gen_lens = [int(x) for x in gen_durations.detach().cpu().tolist()]
+    else:
+        gen_lens = [int(x) for x in gen_durations]
+    if len(gen_lens) != len(ref_lens):
+        raise ValueError("gen_durations must match the number of segments")
+
+    cond = torch.cat(ref_mels, dim=0).unsqueeze(0)
+    text, text_valid_len = build_segmented_text_tokens(
+        cfm, ref_texts, gen_texts, ref_lens, gen_lens,
+        device=device, convert_to_pinyin=convert_to_pinyin,
+    )
+    attn_block_mask = build_segmented_attn_mask(
+        ref_lens,
+        gen_lens,
+        device=device,
+        batch_size=1,
+        gen_visible_text_prefix_len=text_valid_len,
+    )
+    lens = torch.tensor([sum(ref_lens)], device=device, dtype=torch.long)
+    duration = torch.tensor([sum(ref_lens) + sum(gen_lens)], device=device, dtype=torch.long)
+
+    return {
+        "cond": cond,
+        "text": text,
+        "duration": duration,
+        "lens": lens,
+        "attn_block_mask": attn_block_mask,
+        "text_valid_len": text_valid_len,
+        "ref_lens": ref_lens,
+        "gen_lens": gen_lens,
+    }
+
+
 def _tto_inference_kit(
     cfm, vocoder, vad, ref_vad_features,
     cond, text, duration,
@@ -405,6 +581,7 @@ def _tto_inference_kit(
     ref_vad_utter: torch.Tensor | None = None,
     on_opt_vad_utter: Callable[[int, int, torch.Tensor], None] | None = None,
     amp_scale: float = 1.0,
+    attn_block_mask: torch.Tensor | None = None,
 ):
     """Shared setup + closures for sample_with_tto and its budget-sweep variant.
 
@@ -461,7 +638,24 @@ def _tto_inference_kit(
     cond_mask = cond_mask.unsqueeze(-1)
     step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
 
-    mask = lens_to_mask(duration) if batch > 1 else None
+    valid_mask = lens_to_mask(duration)
+    mask = valid_mask if batch > 1 or attn_block_mask is not None else None
+    if attn_block_mask is not None:
+        attn_block_mask = attn_block_mask.to(device=device, dtype=torch.bool)
+        if attn_block_mask.ndim == 2:
+            attn_block_mask = attn_block_mask.unsqueeze(0)
+        if attn_block_mask.ndim != 3:
+            raise ValueError("attn_block_mask must have shape (N, N) or (B, N, N)")
+        if attn_block_mask.shape[0] == 1 and batch > 1:
+            attn_block_mask = attn_block_mask.expand(batch, -1, -1).clone()
+        if attn_block_mask.shape[0] != batch:
+            raise ValueError("attn_block_mask batch size must match cond batch size")
+        if attn_block_mask.shape[-2:] != (int(max_dur.item()), int(max_dur.item())):
+            raise ValueError(
+                "attn_block_mask shape must match final duration "
+                f"({int(max_dur.item())}, {int(max_dur.item())}), got {tuple(attn_block_mask.shape[-2:])}"
+            )
+        attn_block_mask = attn_block_mask & valid_mask.unsqueeze(1) & valid_mask.unsqueeze(2)
     ref_audio_len = int(lens[0].item())
 
     dtype = step_cond.dtype
@@ -484,10 +678,11 @@ def _tto_inference_kit(
             return cfm.transformer(
                 x=x, cond=step_cond, text=text, time=t_scalar, mask=mask,
                 drop_audio_cond=False, drop_text=False, cache=True,
+                attn_block_mask=attn_block_mask,
             )
         pred_cfg = cfm.transformer(
             x=x, cond=step_cond, text=text, time=t_scalar, mask=mask,
-            cfg_infer=True, cache=True,
+            cfg_infer=True, cache=True, attn_block_mask=attn_block_mask,
         )
         pred, null_pred = torch.chunk(pred_cfg, 2, dim=0)
         return pred + (pred - null_pred) * cfg_s
@@ -664,6 +859,7 @@ def sample_with_tto(
     on_opt_vad: Callable[[int, int, torch.Tensor], None] | None = None,
     on_opt_vad_utter: Callable[[int, int, torch.Tensor], None] | None = None,
     amp_scale: float = 1.0,
+    attn_block_mask: torch.Tensor | None = None,
 ):
     """Sample from ``cfm`` with test-time optimization on intermediate latents.
 
@@ -700,7 +896,7 @@ def sample_with_tto(
         vad_level=vad_level, ref_vad_utter=ref_vad_utter,
         on_opt_step=on_opt_step, on_opt_vad=on_opt_vad,
         on_opt_vad_utter=on_opt_vad_utter,
-        amp_scale=amp_scale,
+        amp_scale=amp_scale, attn_block_mask=attn_block_mask,
     )
     t_grid = kit["t_grid"]
 
@@ -758,6 +954,7 @@ def sample_with_tto_budget_sweep(
     ref_vad_utter: torch.Tensor | None = None,
     on_opt_step: Callable[[int, int, float], None] | None = None,
     amp_scale: float = 1.0,
+    attn_block_mask: torch.Tensor | None = None,
 ) -> dict[int, torch.Tensor]:
     """Budget sweep: share TTO work at the first point across multiple per-point
     iter levels.
@@ -788,7 +985,7 @@ def sample_with_tto_budget_sweep(
         window_size=window_size, hop_size=hop_size,
         vad_level=vad_level, ref_vad_utter=ref_vad_utter,
         on_opt_step=on_opt_step, on_opt_vad=None,
-        amp_scale=amp_scale,
+        amp_scale=amp_scale, attn_block_mask=attn_block_mask,
     )
     t_grid = kit["t_grid"]
     first_pt = int(opt_at[0])
@@ -887,23 +1084,40 @@ if __name__ == "__main__":
         "--gen-text",
         default="I don't really care what you call me. I've been a silent spectator.",
     )
+    parser.add_argument(
+        "--use-attn-mask",
+        action="store_true",
+        help="启用分段 block attention mask。启用后 --ref-audio/--ref-text/--gen-text "
+             "按 --segment-delimiter 切分，段数必须一致。",
+    )
+    parser.add_argument(
+        "--segment-delimiter",
+        default="||",
+        help="--use-attn-mask 时用于切分多段 ref-audio/ref-text/gen-text 的分隔符。",
+    )
+    parser.add_argument(
+        "--gen-durations",
+        default=None,
+        help="可选：--use-attn-mask 时每段生成 mel 帧数，按 --segment-delimiter 分隔；"
+             "为空则按各段 ref/gen 文本长度比例估计。",
+    )
     parser.add_argument("--steps", type=int, default=32)
     parser.add_argument("--cfg-strength", type=float, default=2.0)
     parser.add_argument("--sway-coef", type=float, default=-1.0)
     parser.add_argument(
-        "--opt-at", default="16,24",
+        "--opt-at", default="2,4,6,8,10,12,14",
         help="Comma-separated ODE step indices where TTO is performed.",
     )
-    parser.add_argument("--opt-steps", type=int, default=3)
+    parser.add_argument("--opt-steps", type=int, default=50)
     parser.add_argument("--opt-lr", type=float, default=1e-2)
     parser.add_argument("--opt-cfg-strength", type=float, default=1.0)
     parser.add_argument(
-        "--loss-mode", choices=("value", "embedding"), default="value",
+        "--loss-mode", choices=("value", "embedding"), default="embedding",
     )
     parser.add_argument("--window-size", type=float, default=1.0)
     parser.add_argument("--hop-size", type=float, default=0.25)
     parser.add_argument(
-        "--vad-level", choices=("frame", "utter", "both"), default="frame",
+        "--vad-level", choices=("frame", "utter", "both"), default="both",
         help="VAD loss level: 'frame' (framewise MSE), 'utter' "
              "(utterance-level MSE, mirrors VAD_extractor.process_func), or "
              "'both' (frame + utter).",
@@ -972,40 +1186,126 @@ if __name__ == "__main__":
     )
     opt_schedule = [int(s) for s in args.opt_at.split(",") if s.strip()]
 
+    def _split_segments(value: str) -> list[str]:
+        return [x.strip() for x in value.split(args.segment_delimiter) if x.strip()]
+
+    def _parse_gen_durations() -> list[int] | None:
+        if args.gen_durations is None:
+            return None
+        values = _split_segments(args.gen_durations)
+        if not values:
+            return None
+        return [int(x) for x in values]
+
+    def _load_mono(path: str) -> tuple[torch.Tensor, int]:
+        wav, wav_sr = torchaudio.load(path)
+        if wav.shape[0] > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+        return wav, wav_sr
+
+    def _resample_to_target(wav: torch.Tensor, wav_sr: int) -> torch.Tensor:
+        if wav_sr == target_sample_rate:
+            return wav
+        return torchaudio.transforms.Resample(wav_sr, target_sample_rate)(wav)
+
+    def _normalize_ref_text(ref_text: str) -> str:
+        if len(ref_text.encode("utf-8")) and len(ref_text[-1].encode("utf-8")) == 1:
+            return ref_text + " "
+        return ref_text
+
     def _run_one(ref_audio_path: str, out_path: str, viz_base: str | None) -> None:
         # Load reference audio, mono-mix.
-        ref_wav, sr = torchaudio.load(ref_audio_path)
-        if ref_wav.shape[0] > 1:
-            ref_wav = ref_wav.mean(dim=0, keepdim=True)
+        use_attn_mask = bool(args.use_attn_mask)
+        if use_attn_mask:
+            ref_audio_paths = _split_segments(ref_audio_path)
+            ref_text_segments = [_normalize_ref_text(x) for x in _split_segments(args.ref_text)]
+            gen_text_segments = [_normalize_ref_text(x) for x in _split_segments(args.gen_text)]
+            if not (len(ref_audio_paths) == len(ref_text_segments) == len(gen_text_segments)):
+                raise ValueError(
+                    "--use-attn-mask requires the same number of ref-audio, ref-text and gen-text segments; "
+                    f"got {len(ref_audio_paths)}, {len(ref_text_segments)}, {len(gen_text_segments)}"
+                )
+            gen_durations = _parse_gen_durations()
+            if gen_durations is not None and len(gen_durations) != len(ref_audio_paths):
+                raise ValueError("--gen-durations segment count must match --ref-audio when --use-attn-mask is enabled")
 
-        # Raw copy at native sr (no RMS scaling) for VAD extraction — matches
-        # VAD_extractor.process_func semantics on the original audio.
-        ref_wav_for_vad = ref_wav.to(device)
+            loaded_refs = [_load_mono(path) for path in ref_audio_paths]
+            raw_refs_for_vad = [
+                torchaudio.functional.resample(wav, wav_sr, loaded_refs[0][1]) if wav_sr != loaded_refs[0][1] else wav
+                for wav, wav_sr in loaded_refs
+            ]
+            ref_wav_for_vad = torch.cat(raw_refs_for_vad, dim=-1).to(device)
+            sr = loaded_refs[0][1]
 
-        # CFM conditioning path: RMS-normalize + resample to 24 kHz. When the
-        # ref was scaled up to target_rms, gen comes out in target_rms domain,
-        # so we pass amp_scale = rms/target_rms back into sample_with_tto to
-        # pull gen wav back to the ref's original amplitude (matches
-        # utils_infer.py:514-515 and makes VAD loss same-domain vs ref VAD).
-        rms = torch.sqrt(torch.mean(ref_wav.square()))
-        if rms < target_rms:
-            ref_wav = ref_wav * target_rms / rms
-            amp_scale = float(rms / target_rms)
+            # Keep the same amplitude policy as the legacy path, but apply it
+            # to the concatenated reference so all segments share one scale.
+            ref_wav_concat = torch.cat(
+                [_resample_to_target(wav, wav_sr) for wav, wav_sr in loaded_refs],
+                dim=-1,
+            )
+            rms = torch.sqrt(torch.mean(ref_wav_concat.square()))
+            if rms < target_rms:
+                amp_scale = float(rms / target_rms)
+                scale = target_rms / rms
+            else:
+                amp_scale = 1.0
+                scale = 1.0
+            ref_wavs_for_cfm = [
+                (_resample_to_target(wav, wav_sr) * scale).to(device)
+                for wav, wav_sr in loaded_refs
+            ]
+
+            tto_inputs = prepare_segmented_tto_inputs(
+                cfm=tts.ema_model,
+                ref_wavs=ref_wavs_for_cfm,
+                ref_texts=ref_text_segments,
+                gen_texts=gen_text_segments,
+                gen_durations=gen_durations,
+                device=device,
+            )
+            cond = tto_inputs["cond"]
+            text = tto_inputs["text"]
+            duration = tto_inputs["duration"]
+            lens = tto_inputs["lens"]
+            attn_block_mask = tto_inputs["attn_block_mask"]
+            print(
+                "segmented attn mask enabled: "
+                f"segments={len(ref_audio_paths)} ref_lens={tto_inputs['ref_lens']} "
+                f"gen_lens={tto_inputs['gen_lens']}"
+            )
         else:
-            amp_scale = 1.0
-        if sr != target_sample_rate:
-            ref_wav = torchaudio.transforms.Resample(sr, target_sample_rate)(ref_wav)
-        ref_wav = ref_wav.to(device)
+            ref_wav, sr = _load_mono(ref_audio_path)
 
-        ref_text = args.ref_text
-        if len(ref_text.encode("utf-8")) and len(ref_text[-1].encode("utf-8")) == 1:
-            ref_text = ref_text + " "
-        final_text_list = convert_char_to_pinyin([ref_text + args.gen_text])
+            # Raw copy at native sr (no RMS scaling) for VAD extraction — matches
+            # VAD_extractor.process_func semantics on the original audio.
+            ref_wav_for_vad = ref_wav.to(device)
 
-        ref_audio_len = ref_wav.shape[-1] // hop_length
-        ref_text_len = max(len(ref_text.encode("utf-8")), 1)
-        gen_text_len = len(args.gen_text.encode("utf-8"))
-        duration = ref_audio_len + int(ref_audio_len / ref_text_len * gen_text_len)
+            # CFM conditioning path: RMS-normalize + resample to 24 kHz. When the
+            # ref was scaled up to target_rms, gen comes out in target_rms domain,
+            # so we pass amp_scale = rms/target_rms back into sample_with_tto to
+            # pull gen wav back to the ref's original amplitude (matches
+            # utils_infer.py:514-515 and makes VAD loss same-domain vs ref VAD).
+            rms = torch.sqrt(torch.mean(ref_wav.square()))
+            if rms < target_rms:
+                ref_wav = ref_wav * target_rms / rms
+                amp_scale = float(rms / target_rms)
+            else:
+                amp_scale = 1.0
+            if sr != target_sample_rate:
+                ref_wav = torchaudio.transforms.Resample(sr, target_sample_rate)(ref_wav)
+            ref_wav = ref_wav.to(device)
+
+            ref_text = _normalize_ref_text(args.ref_text)
+            final_text_list = convert_char_to_pinyin([ref_text + args.gen_text])
+
+            ref_audio_len = ref_wav.shape[-1] // hop_length
+            ref_text_len = max(len(ref_text.encode("utf-8")), 1)
+            gen_text_len = len(args.gen_text.encode("utf-8"))
+            duration = ref_audio_len + int(ref_audio_len / ref_text_len * gen_text_len)
+            cond = ref_wav
+            text = final_text_list
+            lens = None
+            attn_block_mask = None
 
         emb_flag = (args.loss_mode == "embedding")
         if args.vad_level == "utter":
@@ -1075,9 +1375,10 @@ if __name__ == "__main__":
             vocoder=tts.vocoder,
             vad=vad,
             ref_vad_features=ref_vad,
-            cond=ref_wav,
-            text=final_text_list,
+            cond=cond,
+            text=text,
             duration=duration,
+            lens=lens,
             steps=args.steps,
             cfg_strength=args.cfg_strength,
             sway_sampling_coef=args.sway_coef,
@@ -1097,6 +1398,7 @@ if __name__ == "__main__":
             on_opt_vad=_record,
             on_opt_vad_utter=_record_utter,
             amp_scale=amp_scale,
+            attn_block_mask=attn_block_mask,
         )
         wav_np = wav.squeeze().detach().float().cpu().numpy()
         sf.write(out_path, wav_np, target_sample_rate, subtype="FLOAT")

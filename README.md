@@ -353,11 +353,19 @@ python src/f5_tts/infer/tto.py \
   --viz-path vis
 
 python src/f5_tts/infer/tto.py \
-  --ref-audio asset/actor03_angry-strong_to_sad-strong.wav \
+  --ref-audio asset/actor02_sad-strong_to_surprised-strong.wav \
   --ref-text "Kids are talking by the door. Kids are talking by the door." \
   --gen-text "Kids are talking by the door. Kids are talking by the door." \
   --opt-at "" \
   --output plain_demo.wav
+
+python src/f5_tts/infer/tto.py \
+  --use-attn-mask \
+  --ref-audio "/mnt/disk1/datasets/RAVDESS/Actor_02/03-01-04-02-01-01-02.wav||/mnt/disk1/datasets/RAVDESS/Actor_02/03-01-08-02-01-01-02.wav" \
+  --ref-text "Kids are talking by the door.||Kids are talking by the door." \
+  --gen-text "Kids are talking by the door.||Kids are talking by the door." \
+  --opt-at "" \
+  --output mask.wav
 
 #批量处理
 python src/f5_tts/infer/tto.py \
@@ -432,7 +440,7 @@ config 行格式：`ws|hs|opt_at|opt_steps|lr|loss_mode|vad_level|slide_mode`（
 ./sweep_tto.sh
 
 # 4 卡并行
-./sweep_tto.sh --gpus 0-3
+./sweep_tto.sh --gpus 0-1
 
 # 多卡生成 + 串行评测（显存吃紧时推荐）
 ./sweep_tto.sh --gpus 0-3 --defer-eval
