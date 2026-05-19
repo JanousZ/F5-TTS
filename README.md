@@ -349,8 +349,7 @@ python src/f5_tts/infer/tto.py \
   --loss-mode value --opt-at 2,4,6,8,10,12,14,16,18,20,24,28 --opt-steps 50 --opt-lr 1e-2 \
   --vad-level frame \
   --output tto_demo.wav \
-  --window-size 1.0 --hop-size 0.25 \
-  --viz-path vis
+  --window-size 1.0 --hop-size 0.25
 
 python src/f5_tts/infer/tto.py \
   --ref-audio asset/actor02_sad-strong_to_surprised-strong.wav \
@@ -367,24 +366,56 @@ python src/f5_tts/infer/tto.py \
   --opt-at "" \
   --output mask.wav
 
+python tto.py \
+  --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
+  --utmos-opt-at 2,4,6,8,10,12,14 --utmos-opt-steps 25 --utmos-weight 0.0001 \
+  --grad-proj ortho
+
 #批量处理
 python src/f5_tts/infer/tto.py \
   --ref-text "Kids are talking by the door. Kids are talking by the door." \
   --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
-  --loss-mode value --opt-at 2,4,6,8,10,12,14,16,18,20,24,28 --opt-steps 30 --opt-lr 1e-2 \
-  --vad-level both \
+  --loss-mode embedding --vad-level frame \
+  --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
   --window-size 1.0 --hop-size 0.5 \
-  --batch-size 8 \
+  --batch-size 120 \
   --ref-dir asset \
-  --output tto_outputs/1.0_0.5_both \
-  --viz-path tto_viz/1.0_0.5_both
+  --output tto_outputs/exp1
 
-python src/f5_tts/infer/run_budget_sweep.py \
-  --n-samples 5 \
-  --out-dir experiments/budget_sweep
+python src/f5_tts/infer/tto.py \
+  --ref-text "Kids are talking by the door. Kids are talking by the door." \
+  --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
+  --loss-mode embedding --vad-level both \
+  --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
+  --window-size 1.0 --hop-size 0.5 \
+  --batch-size 120 \
+  --ref-dir asset \
+  --output tto_outputs/exp2
 
-python src/f5_tts/infer/aggregate_budget_sweep.py \
-  --run-dir experiments/budget_sweep/20260422_042004
+python src/f5_tts/infer/tto.py \
+  --ref-text "Kids are talking by the door. Kids are talking by the door." \
+  --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
+  --loss-mode embedding --vad-level both \
+  --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
+  --utmos-opt-at 2,4,6,8,10,12,14 --utmos-opt-steps 25 --utmos-weight 0.0001 \
+  --grad-proj ortho \
+  --window-size 1.0 --hop-size 0.5 \
+  --batch-size 120 \
+  --ref-dir asset \
+  --output tto_outputs/exp3
+
+python src/f5_tts/infer/tto.py \
+  --ref-text "Kids are talking by the door. Kids are talking by the door." \
+  --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
+  --loss-mode embedding --vad-level frame \
+  --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
+  --utmos-opt-at 2,4,6,8,10,12,14 --utmos-opt-steps 25 --utmos-weight 0.0001 \
+  --grad-proj ortho \
+  --window-size 1.0 --hop-size 0.5 \
+  --batch-size 120 \
+  --ref-dir asset \
+  --output tto_outputs/exp4
+  
 
 #指标检测
 python src/f5_tts/eval/eval_metric.py \
@@ -446,7 +477,7 @@ config 行格式：`ws|hs|opt_at|opt_steps|lr|loss_mode|vad_level|slide_mode`（
 ./sweep_tto.sh --gpus 0-3 --defer-eval
 
 # 混合 GPU id
-./sweep_tto.sh --gpus 0,1,3,5-6
+./sweep_utmos.sh --gpus 1-3
 ```
 
 - **工作队列**：每张 GPU 始终只跑一个 config，跑完自动领下一个；不做静态切分，任务时长不均也不空转。

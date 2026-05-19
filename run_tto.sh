@@ -68,7 +68,6 @@ TAG="${LOSS_MODE}-${VAD_LEVEL}_w${WINDOW_SIZE}_h${HOP_SIZE}_at${OPT_AT_SLUG}_s${
 cd "$(dirname "$0")"
 
 OUT_DIR="tto_outputs/${TAG}"
-VIZ_DIR="tto_viz/${TAG}"
 
 extra_tto_args=()
 [[ -n "${CKPT_FILE}"          ]] && extra_tto_args+=(--ckpt-file          "${CKPT_FILE}")
@@ -86,8 +85,7 @@ python src/f5_tts/infer/tto.py \
   --window-size "${WINDOW_SIZE}" --hop-size "${HOP_SIZE}" \
   --batch-size "${BATCH_SIZE}" \
   --ref-dir "${REF_DIR}" \
-  --output "${OUT_DIR}" \
-  --viz-path "${VIZ_DIR}"
+  --output "${OUT_DIR}"
 
 if [[ "${SKIP_EVAL}" -eq 1 ]]; then
   echo "[run_tto] --skip-eval set, stopping after generation"

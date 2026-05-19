@@ -1,14 +1,36 @@
 """Test-time optimization (TTO) for F5-TTS latent code.
 
 At selected ODE steps during sampling, optimize the current latent ``x_t`` so
-the one-step ``x1`` estimate, after vocoder decoding, matches the frame-level
-VAD (valence/arousal/dominance) trajectory of a reference waveform. Supports
-either the regression-head values (``loss_mode='value'``) or the pooled
-wav2vec2 hidden states (``loss_mode='embedding'``) as the target.
+the one-step ``x1`` estimate (decoded by the vocoder) matches reference
+acoustic features. Two loss families can be used jointly or separately:
 
-Only ``x_t`` is optimized — the CFM transformer, vocoder, and VAD encoder stay
-frozen. Integration uses a manual Euler loop so TTO can be injected at any
-grid index; this matches ``CFM.sample``'s default ``method='euler'``.
+* **VAD loss** — frame-level / utter-level MSE between the generated wav's
+  wav2vec2 (valence/arousal/dominance) features and the reference's. Driven by
+  ``opt_schedule`` / ``opt_steps`` / ``opt_lr``.
+* **UTMOS loss** — naturalness regularizer ``w * (5 - mean MOS)`` from a
+  frozen UTMOS22-strong predictor. Driven by ``utmos_opt_schedule`` /
+  ``utmos_opt_steps`` / ``utmos_opt_lr``.
+
+Per ODE step ``i``:
+  * only-VAD step    → one Adam loop on ``vad_loss``.
+  * only-UTMOS step  → one Adam loop on ``utmos_loss``.
+  * both schedules hit ``i`` → first a merged phase of ``min(n_v, n_u)``
+    iters, then a leftover phase of ``|n_v - n_u|`` iters running just the
+    schedule with more budget. Adam state is shared across the two phases
+    (lr swapped per phase, momentum / moment estimates carry over) so the
+    leftover phase continues where the merged phase left off.
+
+The merged phase is either ``vad_loss + utmos_loss`` in a single backward
+(default) or, with ``grad_proj`` set, two per-task backwards followed by
+projection of the UTMOS gradient w.r.t. the VAD gradient:
+  * ``ortho``  — always subtract the component of ``g_utmos`` parallel to
+    ``g_vad`` (UTMOS contributes only the part orthogonal to VAD).
+  * ``pcgrad`` — only project when ``g_vad · g_utmos < 0`` (per-batch).
+
+Only ``x_t`` is optimized — the CFM transformer, vocoder, VAD encoder, and
+UTMOS predictor all stay frozen. Integration is a manual Euler loop so TTO
+can be injected at any grid index; this matches ``CFM.sample``'s default
+``method='euler'``.
 """
 
 from __future__ import annotations
@@ -41,8 +63,32 @@ from f5_tts.model.utils import (
 _VAD_MODEL_NAME = '/mnt/disk1/models/wav2vec2-large-robust-12-ft-emotion-msp-dim'
 _VAD_SR = 16000
 # wav2vec2-large 的 conv stack 总 stride = 320，输入 16 kHz → 输出 ~50 fps
-# (20 ms / frame)。hidden-mode 滑窗用这个把秒数换算成 frame 数。
+# (20 ms / frame)。滑窗用这个把秒数换算成 frame 数。
 _VAD_FRAME_HZ = 50
+
+_UTMOS_HUB_DIR = '/mnt/disk1/models/tts_eval/utmos_hub/hub'
+
+
+def load_utmos(device, dtype: torch.dtype | None = None) -> nn.Module:
+    """加载 UTMOS22-strong（自然度 MOS, 越高越好），冻结。
+
+    backbone 全部 eval；但所有 RNN 子模块强制 train()，绕过 cuDNN
+    "RNN backward can only be called in training mode" 限制（LSTM 无 dropout，
+    train/eval 行为一致）。
+    """
+    torch.hub.set_dir(_UTMOS_HUB_DIR)
+    model = torch.hub.load(
+        "tarepan/SpeechMOS:v1.2.0", "utmos22_strong",
+        trust_repo=True, source="github", verbose=False,
+    ).to(device).eval()
+    if dtype is not None:
+        model = model.to(dtype=dtype)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    for m in model.modules():
+        if isinstance(m, nn.RNNBase):
+            m.train()
+    return model
 
 
 class _RegressionHead(nn.Module):
@@ -77,19 +123,10 @@ class _EmotionModel(Wav2Vec2PreTrainedModel):
 class GradVADExtractor(nn.Module):
     """Differentiable VAD extractor over ``wav2vec2-large-robust-12-ft-emotion-msp-dim``.
 
-    Frozen backbone; gradients flow back to input wav. Two implementations
-    selectable via ``slide_mode``:
-
-      ``audio`` (legacy): unfold raw 16 kHz audio into windows, run the FULL
-        model (wav2vec2 + mean + classifier) on EACH window. Each frame's
-        attention only sees its own ~1 s chunk → out-of-distribution input
-        for the classifier (which was trained on whole utterances), and N×
-        backbone forwards.
-
-      ``hidden`` (default, recommended): one wav2vec2 forward over the full
-        audio → ``(T_frame, 1024)`` hidden state → unfold over the time axis
-        → mean per window → classifier per window. Frames see the full
-        attention context (in-distribution), and only one backbone forward.
+    Frozen backbone; gradients flow back to input wav. One wav2vec2 forward
+    over the full audio → ``(T_frame, 1024)`` hidden state → unfold over the
+    time axis → mean per window → classifier per window. Frames see the full
+    attention context, and only one backbone forward is needed.
     """
 
     def __init__(
@@ -97,12 +134,8 @@ class GradVADExtractor(nn.Module):
         in_sr: int = 24000,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
-        slide_mode: str = "hidden",
     ):
         super().__init__()
-        if slide_mode not in ("audio", "hidden"):
-            raise ValueError(f"slide_mode must be 'audio' or 'hidden', got {slide_mode!r}")
-        self.slide_mode = slide_mode
         self.in_sr = in_sr
         self._processor = Wav2Vec2FeatureExtractor.from_pretrained(_VAD_MODEL_NAME)
         with open(os.path.join(_VAD_MODEL_NAME, 'config.json')) as f:
@@ -152,17 +185,14 @@ class GradVADExtractor(nn.Module):
         window_size: float = 1.0,
         hop_size: float = 0.25,
         embeddings: bool = False,
-        return_both: bool = False,
         pad: bool = True,
         utter: bool = False,
     ):
         """Return frame-level features for ``wav``.
 
-        ``wav`` may be ``(T,)`` or ``(B, T)``. Default output is ``(N, D)`` /
+        ``wav`` may be ``(T,)`` or ``(B, T)``. Output is ``(N, D)`` /
         ``(B, N, D)`` where ``D = hidden_size`` when ``embeddings=True`` and 3
-        otherwise (arousal/dominance/valence). If ``return_both=True``, returns
-        ``(emb, val)`` with shapes ``(..., hidden_size)`` and ``(..., 3)``
-        sharing a single wav2vec2 forward. When ``utter=True``, skips framing
+        otherwise (arousal/dominance/valence). When ``utter=True``, skips framing
         and runs the model on the whole signal (mirrors
         ``VAD_extractor.process_func``); output has ``N=1``.
         """
@@ -176,64 +206,18 @@ class GradVADExtractor(nn.Module):
             signal = self._normalize(wav) if self.do_normalize else wav
             signal = signal.to(next(self.model.parameters()).dtype)
             pooled, logits = self.model(signal)  # (B, D)
-            if return_both:
-                emb, val = pooled.unsqueeze(1), logits.unsqueeze(1)
-                if squeeze_batch:
-                    return emb.squeeze(0), val.squeeze(0)
-                return emb, val
             feat = (pooled if embeddings else logits).unsqueeze(1)  # (B, 1, D)
             return feat.squeeze(0) if squeeze_batch else feat
 
-        if self.slide_mode == "audio":
-            emb, val = self._frame_features_audio_slide(
-                wav, window_size=window_size, hop_size=hop_size, pad=pad,
-            )
-        else:  # "hidden"
-            emb, val = self._frame_features_hidden_slide(
-                wav, window_size=window_size, hop_size=hop_size, pad=pad,
-            )
-        if return_both:
-            if squeeze_batch:
-                emb, val = emb.squeeze(0), val.squeeze(0)
-            return emb, val
+        emb, val = self._frame_features(
+            wav, window_size=window_size, hop_size=hop_size, pad=pad,
+        )
         feat = emb if embeddings else val
         return feat.squeeze(0) if squeeze_batch else feat
 
     # ---- internal helpers ------------------------------------------------
 
-    def _frame_features_audio_slide(
-        self, wav: torch.Tensor, *, window_size: float, hop_size: float, pad: bool,
-    ):
-        """Legacy: unfold raw audio into windows, run full model on each."""
-        win = int(round(window_size * _VAD_SR))
-        hop = int(round(hop_size * _VAD_SR))
-        if win <= 0 or hop <= 0:
-            raise ValueError("window_size and hop_size must be positive")
-
-        B, T = wav.shape
-        if T < win:
-            if not pad:
-                raise ValueError(f"signal shorter ({T}) than window ({win})")
-            wav = F.pad(wav, (0, win - T))
-        elif pad:
-            rem = (T - win) % hop
-            if rem != 0:
-                wav = F.pad(wav, (0, hop - rem))
-
-        frames = wav.unfold(dimension=-1, size=win, step=hop)  # (B, N, win)
-        num_frames = frames.shape[1]
-        frames = frames.reshape(B * num_frames, win)
-
-        if self.do_normalize:
-            frames = self._normalize(frames)
-        frames = frames.to(next(self.model.parameters()).dtype)
-
-        pooled, logits = self.model(frames)
-        emb = pooled.view(B, num_frames, -1)
-        val = logits.view(B, num_frames, -1)
-        return emb, val
-
-    def _frame_features_hidden_slide(
+    def _frame_features(
         self, wav: torch.Tensor, *, window_size: float, hop_size: float, pad: bool,
     ):
         """One backbone forward over full audio, then slide window on hidden."""
@@ -287,91 +271,6 @@ def precompute_reference_vad(
         embeddings=embeddings,
         utter=utter,
     ).detach()
-
-
-def _save_vad_viz(
-    base_path: str,
-    records: list[tuple[int, int, torch.Tensor]],
-    ref_vad: torch.Tensor,
-    final_vad: torch.Tensor | None = None,
-    *,
-    ref_utter: torch.Tensor | None = None,
-    records_utter: list[tuple[int, int, torch.Tensor]] | None = None,
-    final_utter: torch.Tensor | None = None,
-) -> None:
-    """Save per-iter VAD trajectories as CSV + PNG.
-
-    ``records`` is a list of ``(ode_step, opt_iter, gen_vad)`` where gen_vad
-    is ``(N, 3)`` (arousal, dominance, valence). ``ref_vad`` is ``(N_ref, 3)``.
-    ``final_vad`` is the VAD of the post-sampling final audio — shown as an
-    extra solid line, distinct from the TTO trajectory (which stops at the
-    last TTO iter, before the remaining pure-Euler steps).
-
-    Utter-level counterparts (each ``(1, 3)``) — ``ref_utter`` / ``final_utter``
-    / ``records_utter`` — are written to CSV only (no plot overlay).
-    """
-    import csv
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    dim_names = ("arousal", "dominance", "valence")
-
-    def _utter_row(x: torch.Tensor) -> list[float]:
-        return x.view(-1).tolist()
-
-    csv_path = base_path + ".csv"
-    with open(csv_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["phase", "ode_step", "opt_iter", "frame", *dim_names])
-        for i, (a, d, v) in enumerate(ref_vad.tolist()):
-            w.writerow(["ref", -1, -1, i, a, d, v])
-        for step_idx, it, gv in records:
-            for i, (a, d, v) in enumerate(gv.tolist()):
-                w.writerow(["gen", step_idx, it, i, a, d, v])
-        if final_vad is not None:
-            for i, (a, d, v) in enumerate(final_vad.tolist()):
-                w.writerow(["final", -1, -1, i, a, d, v])
-        if ref_utter is not None:
-            a, d, v = _utter_row(ref_utter)
-            w.writerow(["ref_utter", -1, -1, 0, a, d, v])
-        if records_utter:
-            for step_idx, it, uv in records_utter:
-                a, d, v = _utter_row(uv)
-                w.writerow(["gen_utter", step_idx, it, 0, a, d, v])
-        if final_utter is not None:
-            a, d, v = _utter_row(final_utter)
-            w.writerow(["final_utter", -1, -1, 0, a, d, v])
-
-    # each record labelled by cumulative iter, colored dark->light
-    fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
-    n_frames_ref = ref_vad.shape[0]
-    xs_ref = np.arange(n_frames_ref)
-    cmap = plt.get_cmap("viridis")
-    n_total = len(records)
-
-    for d_idx, ax in enumerate(axes):
-        ax.plot(xs_ref, ref_vad[:, d_idx].numpy(),
-                color="red", lw=2.5, ls="--", label="ref", zorder=10)
-        for k, (step_idx, it, gv) in enumerate(records):
-            xs = np.linspace(0, n_frames_ref - 1, gv.shape[0])
-            color = cmap(k / max(n_total - 1, 1))
-            label = f"step={step_idx} iter={it}" if (k == 0 or k == n_total - 1) else None
-            ax.plot(xs, gv[:, d_idx].numpy(), color=color, lw=1.2,
-                    alpha=0.75, label=label)
-        if final_vad is not None:
-            xs_f = np.linspace(0, n_frames_ref - 1, final_vad.shape[0])
-            ax.plot(xs_f, final_vad[:, d_idx].numpy(),
-                    color="black", lw=2.2, ls="-", label="final (post-Euler)",
-                    zorder=11)
-        ax.set_ylabel(dim_names[d_idx])
-        ax.grid(True, alpha=0.3)
-        if d_idx == 0:
-            ax.legend(loc="best", fontsize=8)
-    axes[-1].set_xlabel("frame index (aligned to ref grid)")
-    fig.suptitle("VAD trajectories across TTO iterations (dark→light = early→late)")
-    fig.tight_layout()
-    fig.savefig(base_path + ".png", dpi=120)
-    plt.close(fig)
 
 
 def _align_frames(
@@ -574,21 +473,35 @@ def _tto_inference_kit(
     lens, steps, cfg_strength, sway_sampling_coef, seed,
     max_duration, use_epss, no_ref_audio, edit_mask,
     vocoder_type, sample_rate,
-    opt_lr, opt_cfg_strength, loss_mode,
+    opt_cfg_strength, loss_mode,
     window_size, hop_size,
-    on_opt_step, on_opt_vad,
+    on_opt_step,
     vad_level: str = "frame",
     ref_vad_utter: torch.Tensor | None = None,
-    on_opt_vad_utter: Callable[[int, int, torch.Tensor], None] | None = None,
     amp_scale: float = 1.0,
     attn_block_mask: torch.Tensor | None = None,
+    utmos: nn.Module | None = None,
+    utmos_weight: float = 0.0,
+    grad_proj: str | None = None,
 ):
-    """Shared setup + closures for sample_with_tto and its budget-sweep variant.
+    """Shared setup + closures for ``sample_with_tto``.
 
-    Returns a dict containing: ``t_grid``, ``y0``, ``cond_mask``, ``cond``,
-    ``ref_audio_len``, ``vocoder_dtype``, ``predict_flow``, ``x1_to_wav``,
-    ``vad_loss``, ``tto_step``, ``tto_step_with_snapshots``.
+    Returns a dict with:
+      Tensors / state: ``t_grid``, ``y0``, ``cond_mask``, ``cond``,
+        ``ref_audio_len``, ``vocoder_dtype``.
+      Loss closures (``f(wav) -> (scalar, comps_dict)``):
+        ``vad_loss``, ``utmos_loss`` (None when UTMOS off), ``combined_loss``.
+      One-iter closures (``f(x_var, optimizer, t_cur) -> (loss_float, comps)``):
+        ``iter_vad``, ``iter_utmos``, ``iter_combined``, ``iter_proj``. The
+        last is None unless ``grad_proj`` is set and UTMOS is active; it runs
+        two per-task backwards then projects ``g_utmos`` w.r.t. ``g_vad``.
+      ``tto_step(x_t, t_cur, phases, step_idx)``: run a list of
+        ``(n_iters, lr, iter_fn)`` phases sequentially with one shared Adam
+        optimizer (lr swapped per phase, momentum kept).
     """
+    # ------------------------------------------------------------------
+    # validation
+    # ------------------------------------------------------------------
     if loss_mode not in ("value", "embedding"):
         raise ValueError("loss_mode must be 'value' or 'embedding'")
     if vad_level not in ("frame", "utter", "both"):
@@ -602,7 +515,9 @@ def _tto_inference_kit(
     for p in cfm.parameters():
         p.requires_grad_(False)
 
-    # --- cond / text / duration prep mirrors CFM.sample ---
+    # ------------------------------------------------------------------
+    # cond / text / duration prep — mirrors CFM.sample
+    # ------------------------------------------------------------------
     if cond.ndim == 2:
         cond = cfm.mel_spec(cond)
         cond = cond.permute(0, 2, 1)
@@ -658,6 +573,9 @@ def _tto_inference_kit(
         attn_block_mask = attn_block_mask & valid_mask.unsqueeze(1) & valid_mask.unsqueeze(2)
     ref_audio_len = int(lens[0].item())
 
+    # ------------------------------------------------------------------
+    # ODE grid + initial noise y0
+    # ------------------------------------------------------------------
     dtype = step_cond.dtype
     if use_epss:
         t_grid = get_epss_timesteps(steps, device=device, dtype=dtype)
@@ -673,6 +591,9 @@ def _tto_inference_kit(
         y0.append(torch.randn(dur, cfm.num_channels, device=device, dtype=dtype))
     y0 = pad_sequence(y0, padding_value=0, batch_first=True)
 
+    # ------------------------------------------------------------------
+    # flow / vocoder closures
+    # ------------------------------------------------------------------
     def _predict_flow(x, t_scalar, cfg_s):
         if cfg_s < 1e-5:
             return cfm.transformer(
@@ -706,8 +627,11 @@ def _tto_inference_kit(
             wav = wav * amp_scale
         return wav
 
+    # ------------------------------------------------------------------
+    # loss closures
+    # ------------------------------------------------------------------
     embeddings_flag = (loss_mode == "embedding")
-    _cur = {"step": None, "iter": None}
+    use_utmos = utmos is not None and utmos_weight > 0
 
     def _mse_against(gen_vad: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
         if gen_vad.ndim == 3:
@@ -721,95 +645,151 @@ def _tto_inference_kit(
         g, r = _align_frames(gen_vad, ref)
         return F.mse_loss(g, r)
 
-    def _vad_loss(wav: torch.Tensor) -> torch.Tensor:
+    def _vad_loss(wav: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        """仅 VAD loss；不含 UTMOS。"""
         vad_in = wav.squeeze(0) if wav.shape[0] == 1 else wav
         total = None
         if vad_level in ("frame", "both"):
-            want_viz = on_opt_vad is not None and _cur["step"] is not None
-            if embeddings_flag and want_viz:
-                gen_vad, gen_val = vad(
-                    vad_in, in_sr=sample_rate,
-                    window_size=window_size, hop_size=hop_size,
-                    return_both=True,
-                )
-                on_opt_vad(_cur["step"], _cur["iter"], gen_val.detach())
-            else:
-                gen_vad = vad(
-                    vad_in, in_sr=sample_rate,
-                    window_size=window_size, hop_size=hop_size,
-                    embeddings=embeddings_flag,
-                )
-                if want_viz:
-                    on_opt_vad(_cur["step"], _cur["iter"], gen_vad.detach())
+            gen_vad = vad(
+                vad_in, in_sr=sample_rate,
+                window_size=window_size, hop_size=hop_size,
+                embeddings=embeddings_flag,
+            )
             total = _mse_against(gen_vad, ref_vad_features)
         if vad_level in ("utter", "both"):
-            want_viz_u = on_opt_vad_utter is not None and _cur["step"] is not None
-            if embeddings_flag and want_viz_u:
-                utter_vad, utter_val = vad(
-                    vad_in, in_sr=sample_rate, utter=True, return_both=True,
-                )
-                on_opt_vad_utter(_cur["step"], _cur["iter"], utter_val.detach())
-            else:
-                utter_vad = vad(
-                    vad_in, in_sr=sample_rate, utter=True,
-                    embeddings=embeddings_flag,
-                )
-                if want_viz_u:
-                    on_opt_vad_utter(_cur["step"], _cur["iter"], utter_vad.detach())
+            utter_vad = vad(
+                vad_in, in_sr=sample_rate, utter=True,
+                embeddings=embeddings_flag,
+            )
             ref_u = ref_vad_utter if vad_level == "both" else ref_vad_features
             u_loss = _mse_against(utter_vad, ref_u)
             total = u_loss if total is None else total + u_loss
-        return total
+        return total, {"vad": float(total.detach())}
 
-    def _tto_step(x_t: torch.Tensor, t_cur: torch.Tensor, n_iters: int, step_idx: int) -> torch.Tensor:
-        orig_dtype = x_t.dtype
-        x_var = x_t.detach().clone().float().requires_grad_(True)
-        optimizer = torch.optim.Adam([x_var], lr=opt_lr)
-        for it in range(n_iters):
+    def _utmos_loss(wav: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        """仅 UTMOS loss = utmos_weight * (5 - mean MOS)；调用方需自行保证 use_utmos。"""
+        wav_2d = wav if wav.ndim == 2 else wav.unsqueeze(0)
+        score = utmos(wav_2d, sample_rate)            # (B,) MOS
+        u = (5.0 - score.mean()) * utmos_weight
+        return u, {"utmos": float(u.detach())}
+
+    def _combined_loss(wav: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        """VAD + UTMOS 求和；用于 VAD/UTMOS 重叠 step。"""
+        total, comps = _vad_loss(wav)
+        if use_utmos:
+            u_l, u_c = _utmos_loss(wav)
+            total = total + u_l
+            comps = {**comps, **u_c}
+        return total, comps
+
+    # ------------------------------------------------------------------
+    # one-iter closures: each runs a single Adam iteration on x_var and
+    # returns (loss_float, comps). They are composed into multi-phase
+    # optimization by ``_tto_step``.
+    # ------------------------------------------------------------------
+    if grad_proj not in (None, "ortho", "pcgrad"):
+        raise ValueError(f"grad_proj must be None, 'ortho', or 'pcgrad'; got {grad_proj!r}")
+
+    def _make_single_iter(loss_fn):
+        def step(x_var, optimizer, t_cur):
             optimizer.zero_grad(set_to_none=True)
             cfm.transformer.clear_cache()
-            _cur["step"], _cur["iter"] = step_idx, it
             with torch.enable_grad():
-                v = _predict_flow(x_var.to(orig_dtype), t_cur, opt_cfg_strength)
+                v = _predict_flow(x_var.to(dtype), t_cur, opt_cfg_strength)
                 x1_hat = x_var + (1.0 - t_cur) * v.float()
                 wav = _x1_to_wav(x1_hat)
-                loss = _vad_loss(wav)
+                loss, comps = loss_fn(wav)
             loss.backward()
             optimizer.step()
-            if on_opt_step is not None:
-                on_opt_step(step_idx, it, float(loss.detach()))
-        cfm.transformer.clear_cache()
-        return x_var.detach().to(orig_dtype)
+            return float(loss.detach()), comps
+        return step
 
-    def _tto_step_with_snapshots(x_t, t_cur, max_iters, step_idx, snap_levels):
-        """Run Adam for max_iters; capture x_var snapshots at requested levels.
+    def _make_proj_iter(primary_fn, secondary_fn, mode: str):
+        """Per-task backward + projection of g_secondary w.r.t. g_primary.
 
-        ``snap_levels`` are 1-indexed iter counts: level L == snapshot taken
-        AFTER L optimizer steps. Returns ``{L: x_var.detach().clone()}``.
+        mode='ortho'  → always subtract the component of g_s parallel to g_p.
+        mode='pcgrad' → only subtract when g_p · g_s < 0 (per batch element).
         """
-        snap_set = set(int(x) for x in snap_levels)
-        orig_dtype = x_t.dtype
-        x_var = x_t.detach().clone().float().requires_grad_(True)
-        optimizer = torch.optim.Adam([x_var], lr=opt_lr)
-        snapshots: dict[int, torch.Tensor] = {}
-        for it in range(1, int(max_iters) + 1):
+        def step(x_var, optimizer, t_cur):
             optimizer.zero_grad(set_to_none=True)
             cfm.transformer.clear_cache()
-            _cur["step"], _cur["iter"] = step_idx, it - 1
             with torch.enable_grad():
-                v = _predict_flow(x_var.to(orig_dtype), t_cur, opt_cfg_strength)
+                v = _predict_flow(x_var.to(dtype), t_cur, opt_cfg_strength)
                 x1_hat = x_var + (1.0 - t_cur) * v.float()
                 wav = _x1_to_wav(x1_hat)
-                loss = _vad_loss(wav)
-            loss.backward()
-            optimizer.step()
-            if on_opt_step is not None:
-                on_opt_step(step_idx, it - 1, float(loss.detach()))
-            if it in snap_set:
-                snapshots[it] = x_var.detach().clone().to(orig_dtype)
-        cfm.transformer.clear_cache()
-        return snapshots
+                loss_p, comps_p = primary_fn(wav)
+                loss_s, comps_s = secondary_fn(wav)
 
+            # primary backward first; keep the graph for secondary backward.
+            loss_p.backward(retain_graph=True)
+            g_p = x_var.grad.detach().clone()
+            x_var.grad.zero_()
+            loss_s.backward()
+            g_s = x_var.grad.detach().clone()
+
+            # per-batch projection over the (T, D) axes.
+            B = g_p.shape[0]
+            g_p_flat = g_p.reshape(B, -1)
+            g_s_flat = g_s.reshape(B, -1)
+            denom = (g_p_flat * g_p_flat).sum(dim=1, keepdim=True).clamp_min(1e-12)
+            dot = (g_s_flat * g_p_flat).sum(dim=1, keepdim=True)
+            if mode == "ortho":
+                g_s_flat = g_s_flat - (dot / denom) * g_p_flat
+            else:  # 'pcgrad'
+                mask = (dot < 0).to(dot.dtype)
+                g_s_flat = g_s_flat - mask * (dot / denom) * g_p_flat
+            g_s = g_s_flat.view_as(g_s)
+
+            x_var.grad = g_p + g_s
+            optimizer.step()
+
+            comps = {**comps_p, **comps_s}
+            total = float((loss_p + loss_s).detach())
+            return total, comps
+        return step
+
+    iter_vad = _make_single_iter(_vad_loss)
+    iter_utmos = _make_single_iter(_utmos_loss) if use_utmos else None
+    iter_combined = _make_single_iter(_combined_loss) if use_utmos else None
+    iter_proj = (
+        _make_proj_iter(_vad_loss, _utmos_loss, grad_proj)
+        if (use_utmos and grad_proj is not None) else None
+    )
+
+    def _tto_step(x_t: torch.Tensor, t_cur: torch.Tensor,
+                  phases, step_idx: int) -> torch.Tensor:
+        """Run ``phases`` sequentially with one shared Adam optimizer.
+
+        ``phases``: iterable of ``(n_iters, lr, iter_fn)``. Phases with
+        ``n_iters <= 0`` are skipped. Adam is created lazily on the first
+        non-empty phase; subsequent phases overwrite ``lr`` on
+        ``param_groups`` but momentum / moment estimates carry over so the
+        next phase continues from where the previous one left off.
+        """
+        active = [(n, lr, fn) for n, lr, fn in phases if n > 0]
+        if not active:
+            return x_t
+        x_var = x_t.detach().clone().float().requires_grad_(True)
+        optimizer = None
+        it_global = 0
+        for n_iters, lr, iter_fn in active:
+            if optimizer is None:
+                optimizer = torch.optim.Adam([x_var], lr=lr)
+            else:
+                for pg in optimizer.param_groups:
+                    pg["lr"] = lr
+            for _ in range(n_iters):
+                loss_val, comps = iter_fn(x_var, optimizer, t_cur)
+                if on_opt_step is not None:
+                    on_opt_step(step_idx, it_global, loss_val,
+                                loss_vad=comps.get("vad"), loss_utmos=comps.get("utmos"))
+                it_global += 1
+        cfm.transformer.clear_cache()
+        return x_var.detach().to(dtype)
+
+    # ------------------------------------------------------------------
+    # kit
+    # ------------------------------------------------------------------
     return {
         "t_grid": t_grid,
         "y0": y0,
@@ -820,8 +800,13 @@ def _tto_inference_kit(
         "predict_flow": _predict_flow,
         "x1_to_wav": _x1_to_wav,
         "vad_loss": _vad_loss,
+        "utmos_loss": _utmos_loss if use_utmos else None,
+        "combined_loss": _combined_loss,
+        "iter_vad": iter_vad,
+        "iter_utmos": iter_utmos,
+        "iter_combined": iter_combined,
+        "iter_proj": iter_proj,
         "tto_step": _tto_step,
-        "tto_step_with_snapshots": _tto_step_with_snapshots,
     }
 
 
@@ -856,33 +841,63 @@ def sample_with_tto(
     vad_level: str = "frame",
     ref_vad_utter: torch.Tensor | None = None,
     on_opt_step: Callable[[int, int, float], None] | None = None,
-    on_opt_vad: Callable[[int, int, torch.Tensor], None] | None = None,
-    on_opt_vad_utter: Callable[[int, int, torch.Tensor], None] | None = None,
     amp_scale: float = 1.0,
     attn_block_mask: torch.Tensor | None = None,
+    utmos: nn.Module | None = None,
+    utmos_weight: float = 0.0,
+    utmos_opt_schedule: Iterable[int] | Mapping[int, int] = (),
+    utmos_opt_steps: int | None = None,
+    utmos_opt_lr: float | None = None,
+    grad_proj: str | None = None,
 ):
     """Sample from ``cfm`` with test-time optimization on intermediate latents.
 
-    ``opt_schedule``: iterable of ODE grid indices (each uses ``opt_steps``
-    inner Adam iterations) or a mapping ``{step_idx: inner_iters}``. The index
-    is the position *before* the Euler step (``t_grid[i] -> t_grid[i+1]``).
+    Two independent TTO schedules:
 
-    ``ref_vad_features``: frame-level features from
-    :func:`precompute_reference_vad` (match ``loss_mode``, ``window_size``,
-    ``hop_size``). Shape ``(N_ref, D)`` or ``(B, N_ref, D)``.
+    * VAD: ``opt_schedule`` / ``opt_steps`` / ``opt_lr``
+    * UTMOS: ``utmos_opt_schedule`` / ``utmos_opt_steps`` / ``utmos_opt_lr``
+      (the two ``utmos_opt_*`` defaults fall back to their VAD counterparts.)
 
-    ``amp_scale``: multiplier applied to vocoder output (both in VAD loss and
-    final return) to bring generated audio from target_rms back to the
-    reference's original rms domain. Pass ``rms_ref / target_rms`` when the
-    CFM condition was RMS-normalized; leave ``1.0`` otherwise.
+    Each schedule entry is an ODE grid index ``i`` (the step *before* the
+    Euler update ``t_grid[i] → t_grid[i+1]``) and may be passed as an iterable
+    or as a ``{step_idx: inner_iters}`` mapping.
 
-    ``on_opt_step``: optional callback ``(step_idx, iter_idx, loss)`` invoked
-    after each inner update — useful for logging.
+    Per ``i``:
+      * only-VAD     → Adam loop on ``vad_loss``.
+      * only-UTMOS   → Adam loop on ``utmos_loss``.
+      * both present → first ``min(n_v, n_u)`` iters on a merged loss, then
+        ``|n_v - n_u|`` iters on whichever schedule had more (VAD uses
+        ``opt_lr``; UTMOS uses ``utmos_opt_lr``). Adam state is shared
+        across the two phases (lr swapped, momentum kept).
+
+    Other key knobs:
+      ``ref_vad_features``: precomputed reference VAD ``(N_ref, D)``; must
+        match ``loss_mode`` / ``window_size`` / ``hop_size``.
+      ``amp_scale``: gain applied to vocoder output to undo target_rms
+        normalization (use ``rms_ref / target_rms``; ``1.0`` if not normalized).
+      ``on_opt_step``: optional ``(step_idx, iter, loss, *, loss_vad, loss_utmos)``
+        callback for logging.
+      ``grad_proj``: ``None`` (default) merges the two losses in a single
+        backward in the overlapping phase. ``"ortho"`` backprops each loss
+        separately and subtracts the component of ``g_utmos`` parallel to
+        ``g_vad`` before the Adam step (so UTMOS only moves orthogonal to
+        VAD). ``"pcgrad"`` does the same projection only when
+        ``g_vad · g_utmos < 0`` (per batch element).
     """
-    if isinstance(opt_schedule, Mapping):
-        sched = {int(k): int(v) for k, v in opt_schedule.items()}
-    else:
-        sched = {int(k): int(opt_steps) for k in opt_schedule}
+    def _expand_sched(sch, default_iters):
+        if isinstance(sch, Mapping):
+            return {int(k): int(v) for k, v in sch.items()}
+        return {int(k): int(default_iters) for k in sch}
+
+    sched = _expand_sched(opt_schedule, opt_steps)
+    u_sched = _expand_sched(
+        utmos_opt_schedule,
+        opt_steps if utmos_opt_steps is None else utmos_opt_steps,
+    )
+    u_lr = opt_lr if utmos_opt_lr is None else utmos_opt_lr
+
+    if grad_proj == "none":
+        grad_proj = None
 
     kit = _tto_inference_kit(
         cfm, vocoder, vad, ref_vad_features, cond, text, duration,
@@ -891,21 +906,44 @@ def sample_with_tto(
         max_duration=max_duration, use_epss=use_epss,
         no_ref_audio=no_ref_audio, edit_mask=edit_mask,
         vocoder_type=vocoder_type, sample_rate=sample_rate,
-        opt_lr=opt_lr, opt_cfg_strength=opt_cfg_strength, loss_mode=loss_mode,
+        opt_cfg_strength=opt_cfg_strength, loss_mode=loss_mode,
         window_size=window_size, hop_size=hop_size,
         vad_level=vad_level, ref_vad_utter=ref_vad_utter,
-        on_opt_step=on_opt_step, on_opt_vad=on_opt_vad,
-        on_opt_vad_utter=on_opt_vad_utter,
+        on_opt_step=on_opt_step,
         amp_scale=amp_scale, attn_block_mask=attn_block_mask,
+        utmos=utmos, utmos_weight=utmos_weight,
+        grad_proj=grad_proj,
     )
     t_grid = kit["t_grid"]
+
+    if u_sched and kit["utmos_loss"] is None:
+        raise ValueError("utmos_opt_schedule is non-empty but utmos/utmos_weight not set")
+
+    # 重叠 step 的合并阶段：projection 模式分两次 backward 做正交化，
+    # 否则单次 backward 跑 vad+utmos 求和。
+    overlap_iter = kit["iter_proj"] if grad_proj is not None else kit["iter_combined"]
 
     x_t = kit["y0"]
     for i in range(steps):
         t_cur = t_grid[i]
         t_next = t_grid[i + 1]
-        if sched.get(i, 0) > 0:
-            x_t = kit["tto_step"](x_t, t_cur, sched[i], i)
+        n_v, n_u = sched.get(i, 0), u_sched.get(i, 0)
+        phases: list[tuple[int, float, Callable]] = []
+        if n_v > 0 and n_u > 0:
+            # 重叠 step: 先 min(n_v, n_u) 步 VAD+UTMOS 联合优化, 再用差额步数
+            # 单独跑预算更多的那一边; Adam 状态在两阶段间复用 (lr 切换,
+            # momentum/moment 保留)。
+            n_shared = min(n_v, n_u)
+            phases.append((n_shared, opt_lr, overlap_iter))
+            if n_v > n_u:
+                phases.append((n_v - n_u, opt_lr, kit["iter_vad"]))
+            elif n_u > n_v:
+                phases.append((n_u - n_v, u_lr, kit["iter_utmos"]))
+        elif n_v > 0:
+            phases.append((n_v, opt_lr, kit["iter_vad"]))
+        elif n_u > 0:
+            phases.append((n_u, u_lr, kit["iter_utmos"]))
+        x_t = kit["tto_step"](x_t, t_cur, phases, i)
         with torch.no_grad():
             v = kit["predict_flow"](x_t, t_cur, cfg_strength)
             x_t = x_t + (t_next - t_cur) * v
@@ -923,127 +961,9 @@ def sample_with_tto(
     return wav, sampled
 
 
-def sample_with_tto_budget_sweep(
-    cfm,
-    vocoder: Callable,
-    vad: GradVADExtractor,
-    ref_vad_features: torch.Tensor,
-    cond: torch.Tensor,
-    text,
-    duration,
-    *,
-    opt_at: tuple[int, ...],
-    per_point_iters_levels: Iterable[int],
-    opt_lr: float = 1e-2,
-    opt_cfg_strength: float = 1.0,
-    loss_mode: str = "value",
-    lens: torch.Tensor | None = None,
-    steps: int = 32,
-    cfg_strength: float = 2.0,
-    sway_sampling_coef: float | None = None,
-    seed: int | None = None,
-    max_duration: int = 65536,
-    use_epss: bool = True,
-    no_ref_audio: bool = False,
-    edit_mask: torch.Tensor | None = None,
-    vocoder_type: str = "vocos",
-    sample_rate: int = 24000,
-    window_size: float = 1.0,
-    hop_size: float = 0.25,
-    vad_level: str = "frame",
-    ref_vad_utter: torch.Tensor | None = None,
-    on_opt_step: Callable[[int, int, float], None] | None = None,
-    amp_scale: float = 1.0,
-    attn_block_mask: torch.Tensor | None = None,
-) -> dict[int, torch.Tensor]:
-    """Budget sweep: share TTO work at the first point across multiple per-point
-    iter levels.
-
-    Runs the ODE once; at ``opt_at[0]`` performs TTO for ``max(per_point_iters_levels)``
-    Adam iters, snapshotting ``x_var`` at each level. For each snapshot level
-    ``L``, the rest of the ODE (Euler + TTO at ``opt_at[1:]`` using ``L`` iters
-    each) is completed independently and decoded.
-
-    Returns ``{L: wav}`` keyed by per-point iter count. Multi-point schedules
-    still re-run TTO at ``opt_at[1:]`` per level (those blocks cannot be shared),
-    so savings are largest when ``len(opt_at) == 1``.
-    """
-    if not opt_at:
-        raise ValueError("opt_at must be non-empty")
-    levels = sorted(set(int(x) for x in per_point_iters_levels))
-    if not levels or levels[0] < 1:
-        raise ValueError("per_point_iters_levels must all be >= 1")
-
-    kit = _tto_inference_kit(
-        cfm, vocoder, vad, ref_vad_features, cond, text, duration,
-        lens=lens, steps=steps, cfg_strength=cfg_strength,
-        sway_sampling_coef=sway_sampling_coef, seed=seed,
-        max_duration=max_duration, use_epss=use_epss,
-        no_ref_audio=no_ref_audio, edit_mask=edit_mask,
-        vocoder_type=vocoder_type, sample_rate=sample_rate,
-        opt_lr=opt_lr, opt_cfg_strength=opt_cfg_strength, loss_mode=loss_mode,
-        window_size=window_size, hop_size=hop_size,
-        vad_level=vad_level, ref_vad_utter=ref_vad_utter,
-        on_opt_step=on_opt_step, on_opt_vad=None,
-        amp_scale=amp_scale, attn_block_mask=attn_block_mask,
-    )
-    t_grid = kit["t_grid"]
-    first_pt = int(opt_at[0])
-    max_iters = levels[-1]
-
-    x_t = kit["y0"]
-    for i in range(first_pt):
-        t_cur = t_grid[i]
-        t_next = t_grid[i + 1]
-        with torch.no_grad():
-            v = kit["predict_flow"](x_t, t_cur, cfg_strength)
-            x_t = x_t + (t_next - t_cur) * v
-
-    snapshots = kit["tto_step_with_snapshots"](
-        x_t, t_grid[first_pt], max_iters, first_pt, levels,
-    )
-
-    remaining_pts = set(int(p) for p in opt_at[1:])
-    results: dict[int, torch.Tensor] = {}
-    for L in levels:
-        x_t = snapshots[L]
-        t_cur = t_grid[first_pt]
-        t_next = t_grid[first_pt + 1]
-        with torch.no_grad():
-            v = kit["predict_flow"](x_t, t_cur, cfg_strength)
-            x_t = x_t + (t_next - t_cur) * v
-        for i in range(first_pt + 1, steps):
-            t_cur = t_grid[i]
-            t_next = t_grid[i + 1]
-            if i in remaining_pts:
-                x_t = kit["tto_step"](x_t, t_cur, L, i)
-            with torch.no_grad():
-                v = kit["predict_flow"](x_t, t_cur, cfg_strength)
-                x_t = x_t + (t_next - t_cur) * v
-        cfm.transformer.clear_cache()
-        sampled = torch.where(kit["cond_mask"], kit["cond"], x_t)
-        with torch.no_grad():
-            gen_mel = sampled[:, kit["ref_audio_len"]:, :].permute(0, 2, 1)
-            if kit["vocoder_dtype"] is not None and gen_mel.dtype != kit["vocoder_dtype"]:
-                gen_mel = gen_mel.to(kit["vocoder_dtype"])
-            wav = vocoder.decode(gen_mel) if vocoder_type == "vocos" else vocoder(gen_mel)
-            if amp_scale != 1.0:
-                wav = wav * amp_scale
-        results[L] = wav
-
-    return results
-
-
 if __name__ == "__main__":
     # End-to-end demo: load F5-TTS + vocoder, build reference VAD, then run
-    # sample_with_tto with TTO at two intermediate steps.
-    #
-    # Run from repo root:
-    #   python src/f5_tts/infer/tto.py --ref-audio src/f5_tts/infer/examples/basic/basic_ref_en.wav \
-    #       --ref-text "Some call me nature, others call me mother nature." \
-    #       --gen-text "I don't really care what you call me." \
-    #       --loss-mode value --opt-at 16,24 --opt-steps 3 --opt-lr 1e-2 \
-    #       --output tto_demo.wav
+    # sample_with_tto. See README.md for full command examples.
     import argparse
     from importlib.resources import files
 
@@ -1058,121 +978,119 @@ if __name__ == "__main__":
     )
     from f5_tts.model.utils import convert_char_to_pinyin
 
+    # ====================================================================
+    # CLI
+    # ====================================================================
     parser = argparse.ArgumentParser(description="F5-TTS TTO demo")
+
+    # ---- model & vocoder ----------------------------------------------
     parser.add_argument("--model", default="F5TTS_v1_Base")
-    parser.add_argument(
-        "--ckpt-file", default="",
-        help="本地 CFM 权重 (.safetensors / .pt)；空则走 HF cache",
-    )
-    parser.add_argument(
-        "--vocab-file", default="",
-        help="本地 vocab.txt；空则用包内默认",
-    )
-    parser.add_argument(
-        "--vocoder-local-path", default="",
-        help="本地 vocoder 目录 (vocos: 含 config.yaml + pytorch_model.bin)；空则走 HF",
-    )
-    parser.add_argument(
-        "--ref-audio",
-        default=str(files("f5_tts").joinpath("infer/examples/basic/basic_ref_en.wav")),
-    )
-    parser.add_argument(
-        "--ref-text",
-        default="Some call me nature, others call me mother nature.",
-    )
-    parser.add_argument(
-        "--gen-text",
-        default="I don't really care what you call me. I've been a silent spectator.",
-    )
-    parser.add_argument(
-        "--use-attn-mask",
-        action="store_true",
-        help="启用分段 block attention mask。启用后 --ref-audio/--ref-text/--gen-text "
-             "按 --segment-delimiter 切分，段数必须一致。",
-    )
-    parser.add_argument(
-        "--segment-delimiter",
-        default="||",
-        help="--use-attn-mask 时用于切分多段 ref-audio/ref-text/gen-text 的分隔符。",
-    )
-    parser.add_argument(
-        "--gen-durations",
-        default=None,
-        help="可选：--use-attn-mask 时每段生成 mel 帧数，按 --segment-delimiter 分隔；"
-             "为空则按各段 ref/gen 文本长度比例估计。",
-    )
+    parser.add_argument("--ckpt-file",
+                        default="/mnt/disk1/models/F5-TTS_Emilia-ZH-EN/model_1250000.safetensors",
+                        help="本地 CFM 权重 (.safetensors / .pt)；空则走 HF cache")
+    parser.add_argument("--vocab-file",
+                        default="/mnt/disk1/models/F5-TTS_Emilia-ZH-EN/vocab.txt",
+                        help="本地 vocab.txt；空则用包内默认")
+    parser.add_argument("--vocoder-local-path",
+                        default="/mnt/disk1/models/vocos-mel-24khz",
+                        help="本地 vocoder 目录 (vocos: 含 config.yaml + pytorch_model.bin)；空则走 HF")
+
+    # ---- reference & generation text ----------------------------------
+    parser.add_argument("--ref-audio",
+                        default=str(files("f5_tts").joinpath("infer/examples/basic/basic_ref_en.wav")))
+    parser.add_argument("--ref-text",
+                        default="Some call me nature, others call me mother nature.")
+    parser.add_argument("--gen-text",
+                        default="I don't really care what you call me. I've been a silent spectator.")
+
+    # ---- segmented (block-attn) inputs --------------------------------
+    parser.add_argument("--use-attn-mask", action="store_true",
+                        help="启用分段 block attention mask；ref-audio/ref-text/gen-text 按 --segment-delimiter 切分。")
+    parser.add_argument("--segment-delimiter", default="||",
+                        help="--use-attn-mask 下用于切分多段 ref-audio/ref-text/gen-text 的分隔符")
+    parser.add_argument("--gen-durations", default=None,
+                        help="可选：--use-attn-mask 时每段生成 mel 帧数，按 --segment-delimiter 分隔；空则按文本长度比例估计")
+
+    # ---- ODE sampling -------------------------------------------------
     parser.add_argument("--steps", type=int, default=32)
     parser.add_argument("--cfg-strength", type=float, default=2.0)
     parser.add_argument("--sway-coef", type=float, default=-1.0)
-    parser.add_argument(
-        "--opt-at", default="2,4,6,8,10,12,14",
-        help="Comma-separated ODE step indices where TTO is performed.",
-    )
-    parser.add_argument("--opt-steps", type=int, default=50)
-    parser.add_argument("--opt-lr", type=float, default=1e-2)
+    parser.add_argument("--seed", type=int, default=0)
+
+    # ---- VAD loss / TTO knobs (主要 loss) -----------------------------
+    parser.add_argument("--opt-at", default="2,4,6,8,10,12,14",
+                        help="VAD TTO 触发的 ODE step 索引（逗号分隔）")
+    parser.add_argument("--opt-steps", type=int, default=50,
+                        help="VAD TTO 每个点 Adam 内迭代步数")
+    parser.add_argument("--opt-lr", type=float, default=1e-2,
+                        help="VAD TTO Adam 学习率")
     parser.add_argument("--opt-cfg-strength", type=float, default=1.0)
-    parser.add_argument(
-        "--loss-mode", choices=("value", "embedding"), default="embedding",
-    )
+    parser.add_argument("--loss-mode", choices=("value", "embedding"), default="embedding")
     parser.add_argument("--window-size", type=float, default=1.0)
     parser.add_argument("--hop-size", type=float, default=0.25)
-    parser.add_argument(
-        "--vad-level", choices=("frame", "utter", "both"), default="both",
-        help="VAD loss level: 'frame' (framewise MSE), 'utter' "
-             "(utterance-level MSE, mirrors VAD_extractor.process_func), or "
-             "'both' (frame + utter).",
-    )
-    parser.add_argument(
-        "--vad-slide-mode", choices=("audio", "hidden"), default="hidden",
-        help="frame 模式下滑窗的实现: 'audio' 在原始音频上切窗(每窗独立 wav2vec2 "
-             "forward, OOD 输入); 'hidden' 整段音频一次 forward 拿 hidden state, "
-             "再在时间轴上滑窗(默认, in-distribution + 快几倍).",
-    )
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--vad-level", choices=("frame", "utter", "both"), default="both",
+                        help="frame=framewise MSE; utter=utterance-level MSE; both=两者求和")
+
+    # ---- UTMOS loss / TTO knobs (与 VAD 解耦) -------------------------
+    parser.add_argument("--utmos-weight", type=float, default=0.0,
+                        help=">0 时启用 UTMOS naturalness loss = w*(5 - MOS)")
+    parser.add_argument("--utmos-opt-at", default="",
+                        help="UTMOS TTO 触发的 ODE step 索引；空=不做 UTMOS opt（与 --opt-at 重叠时合并 loss 单次 Adam）")
+    parser.add_argument("--utmos-opt-steps", type=int, default=None,
+                        help="UTMOS TTO 每个点 Adam 内迭代步数；默认 fall back 到 --opt-steps")
+    parser.add_argument("--utmos-opt-lr", type=float, default=None,
+                        help="UTMOS TTO Adam 学习率；默认 fall back 到 --opt-lr")
+    parser.add_argument("--grad-proj", choices=("none", "ortho", "pcgrad"), default="none",
+                        help="VAD+UTMOS 重叠 step 合并阶段的梯度处理: "
+                             "'none' 直接相加 (默认); "
+                             "'ortho' 把 UTMOS 梯度投影到 VAD 梯度的正交补; "
+                             "'pcgrad' 仅当 g_vad·g_utmos<0 时投影")
+
+    # ---- I/O & batch --------------------------------------------------
     parser.add_argument("--output", default="tto_demo.wav",
                         help="单条: 输出文件路径; 批量: 输出目录")
-    parser.add_argument(
-        "--viz-path", default=None,
-        help="单条: 形如 'vis' (产出 vis.csv/vis.png); 批量: 目录路径",
-    )
     parser.add_argument("--batch-size", type=int, default=None,
                         help="启用批量模式，从 --ref-dir 随机采样 N 条 ref 循环处理")
     parser.add_argument("--ref-dir", default="asset",
                         help="批量模式的 ref 音频目录")
     parser.add_argument("--ref-pattern", default="*.wav",
                         help="批量模式下的 ref 文件名 glob 模式")
+
+    # ---- batch + attn_mask: 反查源 wav 的数据集根 ---------------------
+    parser.add_argument("--ravdess-root", default="/mnt/disk1/datasets/RAVDESS",
+                        help="批量 + --use-attn-mask 时反查 RAVDESS 源音频的根目录")
+    parser.add_argument("--esd-root",
+                        default="/mnt/disk1/datasets/ESD/Emotion Speech Dataset",
+                        help="批量 + --use-attn-mask 时反查 ESD 源音频的根目录")
+    parser.add_argument("--silence-db", type=float, default=-50.0,
+                        help="批量 + --use-attn-mask 时对源 ref 静音裁剪阈值 (与 emotion_concat 一致)")
     args = parser.parse_args()
 
     import glob as _glob
     import pathlib
     import random as _random
+    import re as _re
 
-    # --- build job list: either batch-sampled refs or a single ref ---
+    # ====================================================================
+    # job list: batch-sampled refs or a single ref
+    # ====================================================================
     if args.batch_size is not None:
-        candidates = sorted(_glob.glob(
-            os.path.join(args.ref_dir, args.ref_pattern)
-        ))
+        candidates = sorted(_glob.glob(os.path.join(args.ref_dir, args.ref_pattern)))
         if not candidates:
-            print(f"错误: --ref-dir '{args.ref_dir}' 下没有匹配 '{args.ref_pattern}' 的文件")
-            exit(1)
+            raise SystemExit(f"--ref-dir '{args.ref_dir}' 下没有匹配 '{args.ref_pattern}' 的文件")
         n = min(args.batch_size, len(candidates))
         if n < args.batch_size:
-            print(f"提示: 目录仅 {len(candidates)} 个文件 < batch-size {args.batch_size}, "
-                  f"实际采 {n} 个")
-        rng = _random.Random(args.seed)
-        ref_paths = rng.sample(candidates, n)
-        # batch mode: --output / --viz-path 视为目录
+            print(f"提示: 目录仅 {len(candidates)} 个文件 < batch-size {args.batch_size}, 实际采 {n} 个")
+        ref_paths = _random.Random(args.seed).sample(candidates, n)
         out_dir = args.output
         os.makedirs(out_dir, exist_ok=True)
-        viz_dir = args.viz_path
-        if viz_dir:
-            os.makedirs(viz_dir, exist_ok=True)
     else:
         ref_paths = [args.ref_audio]
         out_dir = None
-        viz_dir = None
 
-    # --- load models ONCE ---
+    # ====================================================================
+    # models (load ONCE) + schedule parsing
+    # ====================================================================
     tts = F5TTS(
         model=args.model,
         ckpt_file=args.ckpt_file or "",
@@ -1180,11 +1098,21 @@ if __name__ == "__main__":
         vocoder_local_path=args.vocoder_local_path or None,
     )
     device = tts.device
-    vad = GradVADExtractor(
-        in_sr=target_sample_rate, device=device,
-        slide_mode=args.vad_slide_mode,
-    )
+    vad = GradVADExtractor(in_sr=target_sample_rate, device=device)
+    utmos_model = load_utmos(device) if args.utmos_weight > 0 else None
+    if utmos_model is not None:
+        print(f"UTMOS loss enabled: weight={args.utmos_weight}")
+
     opt_schedule = [int(s) for s in args.opt_at.split(",") if s.strip()]
+    utmos_opt_schedule = [int(s) for s in args.utmos_opt_at.split(",") if s.strip()]
+    if utmos_opt_schedule and utmos_model is None:
+        raise SystemExit("--utmos-opt-at 非空但 --utmos-weight=0；请同时设置两者")
+    if args.utmos_weight > 0 and not utmos_opt_schedule:
+        print("提示: --utmos-weight > 0 但 --utmos-opt-at 为空 → UTMOS loss 不会被优化（仅记录）")
+
+    # ====================================================================
+    # local helpers
+    # ====================================================================
 
     def _split_segments(value: str) -> list[str]:
         return [x.strip() for x in value.split(args.segment_delimiter) if x.strip()]
@@ -1213,162 +1141,192 @@ if __name__ == "__main__":
             return ref_text + " "
         return ref_text
 
-    def _run_one(ref_audio_path: str, out_path: str, viz_base: str | None) -> None:
-        # Load reference audio, mono-mix.
-        use_attn_mask = bool(args.use_attn_mask)
-        if use_attn_mask:
-            ref_audio_paths = _split_segments(ref_audio_path)
-            ref_text_segments = [_normalize_ref_text(x) for x in _split_segments(args.ref_text)]
-            gen_text_segments = [_normalize_ref_text(x) for x in _split_segments(args.gen_text)]
-            if not (len(ref_audio_paths) == len(ref_text_segments) == len(gen_text_segments)):
-                raise ValueError(
-                    "--use-attn-mask requires the same number of ref-audio, ref-text and gen-text segments; "
-                    f"got {len(ref_audio_paths)}, {len(ref_text_segments)}, {len(gen_text_segments)}"
-                )
-            gen_durations = _parse_gen_durations()
-            if gen_durations is not None and len(gen_durations) != len(ref_audio_paths):
-                raise ValueError("--gen-durations segment count must match --ref-audio when --use-attn-mask is enabled")
+    def _split_asset_to_pair(asset_path: str) -> list[tuple[torch.Tensor, int]]:
+        """根据 emotion_concat.py 输出的拼接 ref 文件名反查源 2 段，做同款静音裁剪后返回 [(wav, sr), (wav, sr)]。
 
-            loaded_refs = [_load_mono(path) for path in ref_audio_paths]
-            raw_refs_for_vad = [
-                torchaudio.functional.resample(wav, wav_sr, loaded_refs[0][1]) if wav_sr != loaded_refs[0][1] else wav
-                for wav, wav_sr in loaded_refs
-            ]
-            ref_wav_for_vad = torch.cat(raw_refs_for_vad, dim=-1).to(device)
-            sr = loaded_refs[0][1]
+        命名约定 (emotion_concat.py):
+          RAVDESS: actor{AA}_{emo1}-{int1}_to_{emo2}-{int2}.wav
+          ESD:     spk{SSSS}_{emo1}-{tag1}_to_{emo2}-{tag2}.wav
+                   tag = "i{idx}" 或末 6 位数字 utt id
+        """
+        EMO = {"01": "neutral", "02": "calm", "03": "happy", "04": "sad",
+               "05": "angry", "06": "fearful", "07": "disgust", "08": "surprised"}
+        INT = {"01": "normal", "02": "strong"}
+        INV_EMO = {v: k for k, v in EMO.items()}
+        INV_INT = {v: k for k, v in INT.items()}
 
-            # Keep the same amplitude policy as the legacy path, but apply it
-            # to the concatenated reference so all segments share one scale.
-            ref_wav_concat = torch.cat(
-                [_resample_to_target(wav, wav_sr) for wav, wav_sr in loaded_refs],
-                dim=-1,
-            )
-            rms = torch.sqrt(torch.mean(ref_wav_concat.square()))
-            if rms < target_rms:
-                amp_scale = float(rms / target_rms)
-                scale = target_rms / rms
-            else:
-                amp_scale = 1.0
-                scale = 1.0
-            ref_wavs_for_cfm = [
-                (_resample_to_target(wav, wav_sr) * scale).to(device)
-                for wav, wav_sr in loaded_refs
-            ]
+        def _find_ravdess(actor: str, emo_code: str, int_code: str) -> str:
+            pat = os.path.join(args.ravdess_root, f"Actor_{actor}",
+                               f"03-01-{emo_code}-{int_code}-*-*-{actor}.wav")
+            return sorted(_glob.glob(pat))[0]
 
-            tto_inputs = prepare_segmented_tto_inputs(
-                cfm=tts.ema_model,
-                ref_wavs=ref_wavs_for_cfm,
-                ref_texts=ref_text_segments,
-                gen_texts=gen_text_segments,
-                gen_durations=gen_durations,
-                device=device,
-            )
-            cond = tto_inputs["cond"]
-            text = tto_inputs["text"]
-            duration = tto_inputs["duration"]
-            lens = tto_inputs["lens"]
-            attn_block_mask = tto_inputs["attn_block_mask"]
-            print(
-                "segmented attn mask enabled: "
-                f"segments={len(ref_audio_paths)} ref_lens={tto_inputs['ref_lens']} "
-                f"gen_lens={tto_inputs['gen_lens']}"
-            )
+        def _find_esd(speaker: str, emo_name: str, tag: str) -> str:
+            emo_dir = os.path.join(args.esd_root, speaker, emo_name)
+            if tag.startswith("i"):
+                return sorted(_glob.glob(os.path.join(emo_dir, "*.wav")))[int(tag[1:])]
+            return os.path.join(emo_dir, f"{speaker}_{tag}.wav")
+
+        def _trim_silence(wav: torch.Tensor, threshold_db: float) -> torch.Tensor:
+            energy = 20 * torch.log10(wav.abs().clamp(min=1e-10))
+            mask = (energy > threshold_db).squeeze(0)
+            nz = torch.nonzero(mask)
+            if len(nz) == 0:
+                return wav
+            return wav[:, nz[0].item(): nz[-1].item() + 1]
+
+        stem = pathlib.Path(asset_path).stem
+        m = _re.match(r"actor(\d+)_(\w+)-(\w+)_to_(\w+)-(\w+)$", stem)
+        if m:
+            actor, e1, i1, e2, i2 = m.groups()
+            paths = [_find_ravdess(actor, INV_EMO[e1], INV_INT[i1]),
+                     _find_ravdess(actor, INV_EMO[e2], INV_INT[i2])]
         else:
-            ref_wav, sr = _load_mono(ref_audio_path)
+            m = _re.match(r"spk(\d{4})_([a-z]+)-(\w+)_to_([a-z]+)-(\w+)$", stem)
+            spk, e1, t1, e2, t2 = m.groups()
+            paths = [_find_esd(spk, e1.capitalize(), t1),
+                     _find_esd(spk, e2.capitalize(), t2)]
 
-            # Raw copy at native sr (no RMS scaling) for VAD extraction — matches
-            # VAD_extractor.process_func semantics on the original audio.
-            ref_wav_for_vad = ref_wav.to(device)
+        out: list[tuple[torch.Tensor, int]] = []
+        for p in paths:
+            wav, sr = torchaudio.load(p)
+            if wav.shape[0] > 1:
+                wav = wav.mean(dim=0, keepdim=True)
+            wav = _trim_silence(wav, args.silence_db)
+            out.append((wav, sr))
+        return out
 
-            # CFM conditioning path: RMS-normalize + resample to 24 kHz. When the
-            # ref was scaled up to target_rms, gen comes out in target_rms domain,
-            # so we pass amp_scale = rms/target_rms back into sample_with_tto to
-            # pull gen wav back to the ref's original amplitude (matches
-            # utils_infer.py:514-515 and makes VAD loss same-domain vs ref VAD).
-            rms = torch.sqrt(torch.mean(ref_wav.square()))
-            if rms < target_rms:
-                ref_wav = ref_wav * target_rms / rms
-                amp_scale = float(rms / target_rms)
-            else:
-                amp_scale = 1.0
-            if sr != target_sample_rate:
-                ref_wav = torchaudio.transforms.Resample(sr, target_sample_rate)(ref_wav)
-            ref_wav = ref_wav.to(device)
+    # ====================================================================
+    # per-ref runner
+    # ====================================================================
+    def _prepare_attn_mask_inputs(ref_audio_path, ref_pair_loaded):
+        """Returns (cond, text, duration, lens, attn_block_mask, amp_scale,
+        ref_wav_for_vad, sr) for the segmented (block-attn) path."""
+        ref_text_segments = [_normalize_ref_text(x) for x in _split_segments(args.ref_text)]
+        gen_text_segments = [_normalize_ref_text(x) for x in _split_segments(args.gen_text)]
+        if ref_pair_loaded is not None:
+            loaded_refs = ref_pair_loaded
+        else:
+            loaded_refs = [_load_mono(p) for p in _split_segments(ref_audio_path)]
+        gen_durations = _parse_gen_durations()
+        n_ref = len(loaded_refs)
+        if not (n_ref == len(ref_text_segments) == len(gen_text_segments)):
+            raise ValueError(
+                f"--use-attn-mask: segment count mismatch — refs={n_ref} "
+                f"ref_text={len(ref_text_segments)} gen_text={len(gen_text_segments)}"
+            )
+        if gen_durations is not None and len(gen_durations) != n_ref:
+            raise ValueError("--gen-durations segment count must match the number of ref segments")
 
-            ref_text = _normalize_ref_text(args.ref_text)
-            final_text_list = convert_char_to_pinyin([ref_text + args.gen_text])
+        # VAD reads the cat'd raw audio at the first ref's native sr (no RMS scaling).
+        sr = loaded_refs[0][1]
+        raw_refs_for_vad = [
+            torchaudio.functional.resample(wav, wav_sr, sr) if wav_sr != sr else wav
+            for wav, wav_sr in loaded_refs
+        ]
+        ref_wav_for_vad = torch.cat(raw_refs_for_vad, dim=-1).to(device)
 
-            ref_audio_len = ref_wav.shape[-1] // hop_length
-            ref_text_len = max(len(ref_text.encode("utf-8")), 1)
-            gen_text_len = len(args.gen_text.encode("utf-8"))
-            duration = ref_audio_len + int(ref_audio_len / ref_text_len * gen_text_len)
-            cond = ref_wav
-            text = final_text_list
-            lens = None
-            attn_block_mask = None
+        # CFM conditioning: RMS-normalize the concatenated ref so all segments share one scale.
+        ref_wav_concat = torch.cat(
+            [_resample_to_target(wav, wav_sr) for wav, wav_sr in loaded_refs], dim=-1,
+        )
+        rms = torch.sqrt(torch.mean(ref_wav_concat.square()))
+        if rms < target_rms:
+            amp_scale, scale = float(rms / target_rms), target_rms / rms
+        else:
+            amp_scale, scale = 1.0, 1.0
+        ref_wavs_for_cfm = [
+            (_resample_to_target(wav, wav_sr) * scale).to(device)
+            for wav, wav_sr in loaded_refs
+        ]
+        tto_inputs = prepare_segmented_tto_inputs(
+            cfm=tts.ema_model,
+            ref_wavs=ref_wavs_for_cfm,
+            ref_texts=ref_text_segments,
+            gen_texts=gen_text_segments,
+            gen_durations=gen_durations,
+            device=device,
+        )
+        print(
+            f"segmented attn mask enabled: segments={n_ref} "
+            f"ref_lens={tto_inputs['ref_lens']} gen_lens={tto_inputs['gen_lens']}"
+        )
+        return (tto_inputs["cond"], tto_inputs["text"], tto_inputs["duration"],
+                tto_inputs["lens"], tto_inputs["attn_block_mask"],
+                amp_scale, ref_wav_for_vad, sr)
 
+    def _prepare_classic_inputs(ref_audio_path):
+        """Returns (cond, text, duration, lens, attn_block_mask, amp_scale,
+        ref_wav_for_vad, sr) for the single-ref path."""
+        ref_wav, sr = _load_mono(ref_audio_path)
+        # Raw copy at native sr (no RMS scaling) for VAD extraction.
+        ref_wav_for_vad = ref_wav.to(device)
+        # CFM conditioning: RMS-normalize + resample to 24 kHz. When ref was scaled up to
+        # target_rms, gen comes out in target_rms domain → pass amp_scale = rms/target_rms
+        # back so VAD loss compares same-domain audio.
+        rms = torch.sqrt(torch.mean(ref_wav.square()))
+        if rms < target_rms:
+            ref_wav = ref_wav * target_rms / rms
+            amp_scale = float(rms / target_rms)
+        else:
+            amp_scale = 1.0
+        if sr != target_sample_rate:
+            ref_wav = torchaudio.transforms.Resample(sr, target_sample_rate)(ref_wav)
+        ref_wav = ref_wav.to(device)
+
+        ref_text = _normalize_ref_text(args.ref_text)
+        text = convert_char_to_pinyin([ref_text + args.gen_text])
+
+        ref_audio_len = ref_wav.shape[-1] // hop_length
+        ref_text_len = max(len(ref_text.encode("utf-8")), 1)
+        gen_text_len = len(args.gen_text.encode("utf-8"))
+        duration = ref_audio_len + int(ref_audio_len / ref_text_len * gen_text_len)
+        return (ref_wav, text, duration, None, None,
+                amp_scale, ref_wav_for_vad, sr)
+
+    def _run_one(ref_audio_path: str, out_path: str,
+                 ref_pair_loaded: list[tuple[torch.Tensor, int]] | None = None) -> None:
+        if args.use_attn_mask:
+            cond, text, duration, lens, attn_block_mask, amp_scale, ref_wav_for_vad, sr = \
+                _prepare_attn_mask_inputs(ref_audio_path, ref_pair_loaded)
+        else:
+            cond, text, duration, lens, attn_block_mask, amp_scale, ref_wav_for_vad, sr = \
+                _prepare_classic_inputs(ref_audio_path)
+
+        # ---- precompute reference VAD ----
         emb_flag = (args.loss_mode == "embedding")
+        ref_wav_1d = ref_wav_for_vad.squeeze(0)
+
+        def _ref_vad(*, embeddings, utter):
+            kw = {} if utter else dict(window_size=args.window_size, hop_size=args.hop_size)
+            return precompute_reference_vad(
+                vad, ref_wav_1d, in_sr=sr,
+                embeddings=embeddings, utter=utter, **kw,
+            )
+
         if args.vad_level == "utter":
-            ref_vad = precompute_reference_vad(
-                vad, ref_wav_for_vad.squeeze(0),
-                in_sr=sr,
-                embeddings=emb_flag, utter=True,
-            )
-            ref_vad_u = None
+            ref_vad, ref_vad_u = _ref_vad(embeddings=emb_flag, utter=True), None
         else:
-            ref_vad = precompute_reference_vad(
-                vad, ref_wav_for_vad.squeeze(0),
-                in_sr=sr,
-                window_size=args.window_size, hop_size=args.hop_size,
-                embeddings=emb_flag,
-            )
-            if args.vad_level == "both":
-                ref_vad_u = precompute_reference_vad(
-                    vad, ref_wav_for_vad.squeeze(0),
-                    in_sr=sr,
-                    embeddings=emb_flag, utter=True,
-                )
-            else:
-                ref_vad_u = None
+            ref_vad = _ref_vad(embeddings=emb_flag, utter=False)
+            ref_vad_u = _ref_vad(embeddings=emb_flag, utter=True) if args.vad_level == "both" else None
         print(
             f"ref VAD: primary={tuple(ref_vad.shape)} "
-            f"utter={None if ref_vad_u is None else tuple(ref_vad_u.shape)}  "
-            f"(loss_mode={args.loss_mode} vad_level={args.vad_level})\n"
-            #f"ref_VAD: {ref_vad}"
+            f"utter={None if ref_vad_u is None else tuple(ref_vad_u.shape)} "
+            f"(loss_mode={args.loss_mode} vad_level={args.vad_level})"
         )
 
-        if viz_base:
-            ref_vad_val = precompute_reference_vad(
-                vad, ref_wav_for_vad.squeeze(0),
-                in_sr=sr,
-                window_size=args.window_size, hop_size=args.hop_size,
-                embeddings=False,
-            )
-            if args.vad_level in ("utter", "both"):
-                ref_vad_val_utter = precompute_reference_vad(
-                    vad, ref_wav_for_vad.squeeze(0),
-                    in_sr=sr,
-                    embeddings=False, utter=True,
-                )
+        def _log(step_idx, it, loss, *, loss_vad=None, loss_utmos=None):
+            if loss_vad is not None and loss_utmos is not None:
+                tag = "vad+utmos"
+            elif loss_vad is not None:
+                tag = "vad"
             else:
-                ref_vad_val_utter = None
-        else:
-            ref_vad_val = None
-            ref_vad_val_utter = None
-
-        def _log(step_idx, it, loss):
-            print(f"[TTO] step={step_idx:02d} iter={it} loss={loss:.6f}")
-
-        viz_records: list[tuple[int, int, torch.Tensor]] = []
-        viz_records_utter: list[tuple[int, int, torch.Tensor]] = []
-        if viz_base:
-            def _record(step_idx, it, gen_vad):
-                viz_records.append((step_idx, it, gen_vad.float().cpu()))
-            def _record_utter(step_idx, it, uv):
-                viz_records_utter.append((step_idx, it, uv.float().cpu()))
-        else:
-            _record = None
-            _record_utter = None
+                tag = "utmos"
+            parts = [f"loss={loss:.6f}"]
+            if loss_vad is not None:
+                parts.append(f"vad={loss_vad:.6f}")
+            if loss_utmos is not None:
+                parts.append(f"utmos={loss_utmos:.6f}")
+            print(f"[TTO][{tag}] step={step_idx:02d} iter={it} " + " ".join(parts))
 
         wav, _ = sample_with_tto(
             cfm=tts.ema_model,
@@ -1395,66 +1353,37 @@ if __name__ == "__main__":
             vocoder_type=tts.mel_spec_type,
             sample_rate=target_sample_rate,
             on_opt_step=_log,
-            on_opt_vad=_record,
-            on_opt_vad_utter=_record_utter,
             amp_scale=amp_scale,
             attn_block_mask=attn_block_mask,
+            utmos=utmos_model,
+            utmos_weight=args.utmos_weight,
+            utmos_opt_schedule=utmos_opt_schedule,
+            utmos_opt_steps=args.utmos_opt_steps,
+            utmos_opt_lr=args.utmos_opt_lr,
+            grad_proj=args.grad_proj,
         )
         wav_np = wav.squeeze().detach().float().cpu().numpy()
         sf.write(out_path, wav_np, target_sample_rate, subtype="FLOAT")
         print(f"saved: {out_path}  ({wav_np.shape[-1] / target_sample_rate:.2f}s)")
 
-        if viz_base:
-            wav_for_vad = wav.squeeze(0) if wav.ndim == 2 else wav
-            with torch.no_grad():
-                final_vad = vad(
-                    wav_for_vad,
-                    in_sr=target_sample_rate,
-                    window_size=args.window_size, hop_size=args.hop_size,
-                    embeddings=False,
-                ).float().cpu()
-                if args.vad_level in ("utter", "both"):
-                    final_utter = vad(
-                        wav_for_vad, in_sr=target_sample_rate,
-                        utter=True, embeddings=False,
-                    ).float().cpu()
-                else:
-                    final_utter = None
-            ref_utter_cpu = (ref_vad_val_utter.float().cpu()
-                             if ref_vad_val_utter is not None else None)
-            _save_vad_viz(
-                viz_base, viz_records,
-                ref_vad_val.float().cpu(), final_vad=final_vad,
-                ref_utter=ref_utter_cpu,
-                records_utter=viz_records_utter,
-                final_utter=final_utter,
-            )
-            print(f"viz saved: {viz_base}.csv / {viz_base}.png")
-            if ref_utter_cpu is not None or final_utter is not None:
-                def _fmt(t):
-                    a, d, v = t.view(-1).tolist()
-                    return f"arousal={a:.4f} dominance={d:.4f} valence={v:.4f}"
-                if ref_utter_cpu is not None:
-                    print(f"utter VAD  ref  : {_fmt(ref_utter_cpu)}")
-                if final_utter is not None:
-                    print(f"utter VAD  final: {_fmt(final_utter)}")
-                if ref_utter_cpu is not None and final_utter is not None:
-                    d = (final_utter.view(-1) - ref_utter_cpu.view(-1)).abs()
-                    print(f"utter VAD  |Δ| : arousal={d[0].item():.4f} "
-                          f"dominance={d[1].item():.4f} valence={d[2].item():.4f}")
-
-    # --- run (single or batch) ---
+    # ====================================================================
+    # main loop (single or batch)
+    # ====================================================================
     total = len(ref_paths)
     for idx, rp in enumerate(ref_paths, 1):
-        stem = pathlib.Path(rp).stem
         if out_dir is not None:
+            stem = pathlib.Path(rp).stem
             out_path = os.path.join(out_dir, f"{stem}.wav")
-            viz_base = os.path.join(viz_dir, stem) if viz_dir else None
             print(f"\n=== [{idx}/{total}] ref={rp} ===")
         else:
             out_path = args.output
-            viz_base = args.viz_path
-        _run_one(rp, out_path, viz_base)
+        if args.batch_size is not None and args.use_attn_mask:
+            pair = _split_asset_to_pair(rp)
+            print(f"  pair sources: {[p[0].shape[-1] for p in pair]} samples (post-trim) "
+                  f"@ sr={[p[1] for p in pair]}")
+            _run_one(rp, out_path, ref_pair_loaded=pair)
+        else:
+            _run_one(rp, out_path)
 
     if total > 1:
         print(f"\n批量完成: {total} 条输出保存在 {out_dir}")
