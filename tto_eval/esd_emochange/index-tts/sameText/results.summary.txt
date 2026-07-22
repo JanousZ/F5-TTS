@@ -1,0 +1,13 @@
+eval summary for /home/yanzhang/F5-TTS/tto_eval/esd_emochange/index-tts/sameText (n=300, skipped=0, wall=204.9s)
+ref     : /home/yanzhang/F5-TTS/tto_eval/esd_emochange/manifest_sameText.jsonl
+
+metric                   mean        std        min        max     n
+--------------------------------------------------------------------
+wer                    0.0942     0.1344     0.0000     1.0000   300
+utmos                  3.3281     0.3879     1.7015     4.2253   300
+spk_sim                0.8115     0.0802     0.0068     0.9192   300
+EMO-sim_utt            0.8974     0.1252     0.2268     0.9996   300
+EMO-sim_frame          0.8777     0.1274     0.2228     0.9983   300
+av_sim_utt             0.9253     0.1986    -1.0000     1.0000   300
+av_sim_chunk           0.8213     0.1740     0.1517     0.9953   300
+pcp_score              3.8058     0.4612    -1.2329     4.4252   300

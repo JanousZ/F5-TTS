@@ -1,83 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Each row: window_size|hop_size|opt_at|opt_steps|opt_lr|loss_mode|vad_level|slide_mode
-#   loss_mode  : value | embedding
-#   vad_level  : frame | utter | both
-#   slide_mode : hidden (default, 1× backbone forward + slide on hidden)
-#                audio  (legacy: per-window wav2vec2, slower & OOD)
+# Each row: window_size|hop_size|opt_at|opt_steps|opt_lr|loss_mode|vad_level
+#   loss_mode : value | embedding
+#   vad_level : frame | utter | both
 # Each row runs tto generation + batch eval into a TAG-named folder, so
-# different combinations never clobber. The TAG suffix _sm<mode> distinguishes
-# slide_mode runs explicitly.
+# different combinations never clobber.
 configs=(
-    "0.5|0.25|2,4,6,8,10,12,14|100|1e-2|embedding|both|hidden"
-    "1.0|0.25|2,4,6,8,10,12,14|60|1e-2|embedding|both|audio"
-    "0.5|0.25|2,4,6,8,10,12,14|50|1e-2|embedding|both|hidden"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|frame|audio"
-    "1.0|0.25||50|1e-2|value|frame|audio"
-    "0.5|0.25|2,4,6,8,10,12,14|90|1e-2|embedding|both|hidden"
-    "1.0|0.25|2,6,10,14,18,24,28|100|1e-2|value|utter|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|50|1e-2|embedding|both|hidden"
-    "1.0|0.25|2,4,6,8,10,12,14|100|1e-2|embedding|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|60|1e-2|embedding|both|audio"
-    "1.0|0.25|2,6,10,14,18,24,28|100|1e-2|embedding|utter|audio"
-    "0.5|0.25|2,4,6,8,10,12,14|60|1e-2|embedding|both|hidden"
-    "0.5|0.25|2,4,6,8,10,12,14|50|1e-2|embedding|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|50|1e-2|embedding|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|90|1e-2|embedding|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|500|2e-3|value|both|audio"
-    "0.5|0.25|2,4,6,8,10,12,14|90|1e-2|embedding|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|500|2e-3|value|utter|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|60|1e-2|value|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|100|1e-2|embedding|both|hidden"
-    "1.0|0.25|2,4,6,8,10,12,14|80|1e-2|embedding|both|audio"
-    "0.5|0.25|2,4,6,8,10,12,14|80|1e-2|embedding|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|embedding|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|70|1e-2|embedding|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|250|1e-3|value|frame|audio"
-    "1.0|0.25|2,6,10,14,18,24,28|100|1e-2|embedding|both|audio"
-    "0.5|0.25|2,4,6,8,10,12,14|100|1e-2|embedding|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|90|1e-2|embedding|both|hidden"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|500|2e-3|embedding|utter|audio"
-    "1.0|0.25|2,6,10,14,18,24,28|80|1e-2|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|60|1e-2|value|utter|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|embedding|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|embedding|utter|audio"
-    "1.0|0.25|2,6,10,14,18,24,28|50|1e-2|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|60|1e-2|embedding|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|utter|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|40|1e-2|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|250|2e-3|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|500|1e-3|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|50|1e-2|value|both|audio"
-    "0.5|0.25|2,4,6,8,10,12,14|60|1e-2|embedding|both|audio"
-    "1.0|0.25|2,6,10,14,18,24,28|100|1e-2|value|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|60|1e-2|embedding|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|100|1e-2|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|50|1e-2|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|60|1e-2|embedding|utter|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|500|2e-3|embedding|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|80|1e-2|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|100|5e-3|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|40|1e-2|value|frame|audio"
-    "1.0|0.25|2,6,10,14,18,24,28|100|1e-2|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|30|1e-2|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|30|1e-2|value|frame|audio"
-    "1.0|0.25|2,6,10,14,18,24,28|30|1e-2|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|40|1e-2|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|500|2e-3|value|frame|audio"
-    "0.5|0.25|2,4,6,8,10,12,14|70|1e-2|embedding|both|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|500|2e-3|embedding|both|audio"
-    "1.0|0.25|2,6,10,14,18,24,28|100|1e-2|embedding|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14,16,18,20,24,28|150|5e-3|value|frame|audio"
-    "1.0|0.25|16,18,20,24,28,31|40|1e-2|value|frame|audio"
-    "1.0|0.25|16,18,20,24,28,31|30|1e-2|value|frame|audio"
-    "1.0|0.25|16,18,20,24,28,31|50|1e-2|value|frame|audio"
-    "1.0|0.25|16,18,20,24,28,31|100|1e-2|value|frame|audio"
-    "1.0|0.25|16,18,20,24,28,31|60|1e-2|value|frame|audio"
-    "1.0|0.25|16,18,20,24,28,31,14,16,18,20,24,28|75|1e-2|value|frame|audio"
-    "1.0|0.25|2,4,6,8,10,12,14|60|1e-2|value|frame|audio"
-    "1.0|0.25|16,18,20,24,28,31|80|1e-2|value|frame|audio"
+    "0.5|0.25|2,4,6,8,10,12,14|100|1e-2|embedding|both"
+    "1.0|0.25|2,4,6,8,10,12,14|100|"
 )
 
 GPUS="0"
@@ -157,18 +88,16 @@ trap 'echo; echo "[sweep] interrupted — killing children"; \
       done; wait; exit 130' INT TERM
 
 cfg_to_tag() {
-  local cfg="$1" ws hs oa os lr lm vl sm
-  IFS='|' read -r ws hs oa os lr lm vl sm <<< "$cfg"
-  sm="${sm:-hidden}"   # backwards compat for older 7-field rows
+  local cfg="$1" ws hs oa os lr lm vl
+  IFS='|' read -r ws hs oa os lr lm vl <<< "$cfg"
   local oa_slug="${oa//,/-}"
-  echo "${lm}-${vl}_w${ws}_h${hs}_at${oa_slug}_s${os}_lr${lr}_sm${sm}"
+  echo "${lm}-${vl}_w${ws}_h${hs}_at${oa_slug}_s${os}_lr${lr}"
 }
 
 launch() {
   local gpu="$1" idx="$2" cfg="$3"
-  local ws hs oa os lr lm vl sm
-  IFS='|' read -r ws hs oa os lr lm vl sm <<< "$cfg"
-  sm="${sm:-hidden}"
+  local ws hs oa os lr lm vl
+  IFS='|' read -r ws hs oa os lr lm vl <<< "$cfg"
   local tag; tag=$(cfg_to_tag "$cfg")
   local log="${LOG_DIR}/${idx}_gpu${gpu}_${tag}.log"
   local extra_args=()
@@ -176,14 +105,14 @@ launch() {
 
   CUDA_VISIBLE_DEVICES="$gpu" ./run_tto.sh \
     "${extra_args[@]}" \
-    --loss-mode "$lm" --vad-level "$vl" --vad-slide-mode "$sm" \
+    --loss-mode "$lm" --vad-level "$vl" \
     --window-size "$ws" --hop-size "$hs" \
     --opt-at "$oa" --opt-steps "$os" --opt-lr "$lr" \
     >"$log" 2>&1 &
   local pid=$!
   gpu_pid[$gpu]=$pid
   pid_info[$pid]="gpu=${gpu} idx=${idx}/${total} tag=${tag}"
-  echo "[dispatch] $(date +%H:%M:%S)  gpu=${gpu} pid=${pid}  [$idx/$total] ${lm}-${vl}-${sm} ws=${ws} hs=${hs}  → ${log}"
+  echo "[dispatch] $(date +%H:%M:%S)  gpu=${gpu} pid=${pid}  [$idx/$total] ${lm}-${vl} ws=${ws} hs=${hs}  → ${log}"
 }
 
 # Find a GPU whose previous job has exited; block (poll) until one is free.

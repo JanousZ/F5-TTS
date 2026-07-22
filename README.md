@@ -339,160 +339,186 @@ python emotion_concat.py \
   --skip_existing \
   --output_dir asset
 
-# TTO
+# TTO (Test-Time Optimization)
+
+`src/f5_tts/infer/tto.py` 在 F5-TTS 采样的若干 ODE step 上对 latent `x_t` 做 Adam 优化，让 vocoder 解出的 wav 在 wav2vec2 [VAD (valence/arousal/dominance)](https://huggingface.co/audeering/wav2vec2-large-robust-12-ft-emotion-msp-dim) 空间里逼近参考音频。CFM transformer / vocoder / VAD encoder 全程冻结。
+
+默认只优化 VAD loss；可通过 `--spk-loss-weight λ` 附加 **SIM-O speaker similarity loss**（WavLM-Large + ECAPA-TDNN，与 `eval_metric.py` 的 `spk_sim` 完全同源），按 `L = L_vad + λ·L_spk` 加权求和。UTMOS loss 已移除；`eval_metric.py` 里 `compute_utmos` 仍作为独立评测指标保留。
+
+## CLI：三种输入模式
+
+### 1. 单条推理
+
+```bash
+# 不做 TTO 的 baseline（等价于 CFM.sample）
+python src/f5_tts/infer/tto.py \
+  --ref-audio path/to/ref.wav \
+  --ref-text "the text spoken in ref.wav" \
+  --gen-text "the text you want to generate" \
+  --opt-at "" \
+  --output baseline.wav
+
+# 开 TTO：在 ODE step 2/4/6/8/10/12/14 各跑 50 步 Adam (lr=1e-2)
+python src/f5_tts/infer/tto.py \
+  --ref-audio path/to/ref.wav \
+  --ref-text "..." \
+  --gen-text "..." \
+  --loss-mode embedding --vad-level both \
+  --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
+  --window-size 1.0 --hop-size 0.25 \
+  --output tto_demo.wav
+
+python src/f5_tts/infer/tto.py \
+  --ref-audio /home/yanzhang/F5-TTS/tto_eval/esd_emochange/refs/0012_happy2sad_012.wav \
+  --ref-text "He was still in the forest! That I owe my thanks to you." \
+  --gen-text "The fisherman and his wife see George every day. I believe you are one of them!" \
+  --loss-mode embedding --vad-level frame \
+  --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
+  --window-size 0.5 --hop-size 0.25 \
+  --output e_f_2,4,6,8,10,12,14_50_1e-2_0.5_0.25.wav
+```
+
+主要旋钮：
+
+| 参数 | 取值 | 含义 |
+|------|------|------|
+| `--loss-mode` | `value` / `embedding` | VAD 头的 3-维 (V/A/D) 输出，还是 hidden embedding (1024-维) |
+| `--vad-level` | `frame` / `utter` / `both` | frame-wise MSE / utterance-level MSE / 两者求和 |
+| `--opt-at` | CSV 索引 (e.g. `"2,4,6,8"`) | 哪些 ODE step 触发 TTO；`""` = 完全关掉 |
+| `--opt-steps` | int | 每个 step 的 Adam 内迭代步数 |
+| `--opt-lr` | float | Adam 学习率 |
+| `--spk-loss-weight` | float (default `0.0`) | SIM-O loss 权重 λ；`0` 关闭（不加载 WavLM）；典型 `0.01–1.0`，**见下方量级提示** |
+| `--window-size` / `--hop-size` | sec | frame VAD 提取的滑窗 |
+| `--steps` | int (default 32) | ODE 总步数 |
+| `--cfg-strength` | float (default 2.0) | 推理时 CFG 强度 |
+
+> **λ 量级提示**：冷启动 generation 的 SIM-O 距离 `1 - cos` ≈ 0.6–0.7，而 `--loss-mode embedding` 下的 VAD MSE ≈ 0.005–0.02，两者**相差约 50–100×**。所以 `λ=1.0` 会让 SIM-O 完全主导、压过 VAD 信号；想让两路平衡，从 `λ=0.05` 起步扫。`--loss-mode value` 下 VAD MSE 大一个量级（~0.1），`λ≈1.0` 才接近平衡。启用后会额外加载 WavLM-Large (316 M) 并 backprop 通过 24 层 transformer，**VRAM 涨 6–10 GB**——OOM 时调小 `--opt-at` / `--opt-steps`。
+
+### 2. 批量模式 (legacy `--ref-dir`)
+
+从一个目录随机采 N 条 ref 跑同一对 `--ref-text` / `--gen-text`：
 
 ```bash
 python src/f5_tts/infer/tto.py \
-  --ref-audio asset/actor04_angry-strong_to_sad-strong.wav \
-  --ref-text "Kids are talking by the door. Kids are talking by the door." \
-  --gen-text "Kids are talking by the door. Kids are talking by the door." \
-  --loss-mode value --opt-at 2,4,6,8,10,12,14,16,18,20,24,28 --opt-steps 50 --opt-lr 1e-2 \
-  --vad-level frame \
-  --output tto_demo.wav \
-  --window-size 1.0 --hop-size 0.25
-
-python src/f5_tts/infer/tto.py \
-  --ref-audio asset/actor02_sad-strong_to_surprised-strong.wav \
-  --ref-text "Kids are talking by the door. Kids are talking by the door." \
-  --gen-text "Kids are talking by the door. Kids are talking by the door." \
-  --opt-at "" \
-  --output plain_demo.wav
-
-python src/f5_tts/infer/tto.py \
-  --use-attn-mask \
-  --ref-audio "/mnt/disk1/datasets/RAVDESS/Actor_02/03-01-04-02-01-01-02.wav||/mnt/disk1/datasets/RAVDESS/Actor_02/03-01-08-02-01-01-02.wav" \
-  --ref-text "Kids are talking by the door.||Kids are talking by the door." \
-  --gen-text "Kids are talking by the door.||Kids are talking by the door." \
-  --opt-at "" \
-  --output mask.wav
-
-python tto.py \
-  --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
-  --utmos-opt-at 2,4,6,8,10,12,14 --utmos-opt-steps 25 --utmos-weight 0.0001 \
-  --grad-proj ortho
-
-#批量处理
-python src/f5_tts/infer/tto.py \
+  --ref-dir asset --batch-size 120 \
   --ref-text "Kids are talking by the door. Kids are talking by the door." \
   --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
   --loss-mode embedding --vad-level frame \
   --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
-  --window-size 1.0 --hop-size 0.5 \
-  --batch-size 120 \
-  --ref-dir asset \
-  --output tto_outputs/exp1
+  --output tto_outputs/exp_batch
+```
 
-python src/f5_tts/infer/tto.py \
-  --ref-text "Kids are talking by the door. Kids are talking by the door." \
-  --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
-  --loss-mode embedding --vad-level both \
-  --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
-  --window-size 1.0 --hop-size 0.5 \
-  --batch-size 120 \
-  --ref-dir asset \
-  --output tto_outputs/exp2
+### 3. Manifest 模式 (推荐，每行独立 ref/gen 文本)
 
-python src/f5_tts/infer/tto.py \
-  --ref-text "Kids are talking by the door. Kids are talking by the door." \
-  --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
-  --loss-mode embedding --vad-level both \
-  --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
-  --utmos-opt-at 2,4,6,8,10,12,14 --utmos-opt-steps 25 --utmos-weight 0.0001 \
-  --grad-proj ortho \
-  --window-size 1.0 --hop-size 0.5 \
-  --batch-size 120 \
-  --ref-dir asset \
-  --output tto_outputs/exp3
+每行 JSONL 自带 `stem / ref_wav / ref_text / gen_text`，专为 ESD ([Emotional Speech Dataset](https://github.com/HLTSingapore/Emotional-Speech-Data)) 0011–0020 的 emo-change 评测设计：
 
+```bash
+# (a) 一次性构建评测集（默认 spk=0011+0012，300 stem，~52 MB refs/）
+python src/f5_tts/eval/build_emochange_eval.py \
+  --esd-root /mnt/disk1/datasets/ESD \
+  --out-dir tto_eval/esd_emochange
+
+# (b) 跑生成
 python src/f5_tts/infer/tto.py \
-  --ref-text "Kids are talking by the door. Kids are talking by the door." \
-  --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
+  --manifest tto_eval/esd_emochange/manifest_disjoint.jsonl \
+  --output tto_outputs/esd_disjoint_emo0.0001 \
   --loss-mode embedding --vad-level frame \
   --opt-at 2,4,6,8,10,12,14 --opt-steps 50 --opt-lr 1e-2 \
-  --utmos-opt-at 2,4,6,8,10,12,14 --utmos-opt-steps 25 --utmos-weight 0.0001 \
-  --grad-proj ortho \
-  --window-size 1.0 --hop-size 0.5 \
-  --batch-size 120 \
-  --ref-dir asset \
-  --output tto_outputs/exp4
-  
+  --emo-loss-weight 0.0001
 
-#指标检测
+```
+
+`build_emochange_eval.py` 默认产两个 manifest，共享同一份 `refs/`：
+
+- **`manifest_disjoint.jsonl`** — `gen_text` 与 `ref_text` 完全不重叠，测「情感是否真转移到了新内容」
+- **`manifest_sameText.jsonl`** — `gen_text == ref_text`，上限对照（spk/e2v sim 期望接近 1.0）
+
+`--manifest` 与 `--batch-size` 互斥。
+
+## 评测
+
+### 单对：`eval_metric.py`
+
+6 个指标（WER/CER、spk_sim、EMO-sim_utt/frame、av_sim_utt/chunk、pcp_score）+ UTMOS naturalness：
+
+```bash
 python src/f5_tts/eval/eval_metric.py \
-  --ref ./asset/actor01_angry-strong_to_surprised-strong.wav \
-  --gen ./asset/actor01_happy-strong_to_sad-strong.wav \
-  --text "Some call me nature, others call me mother nature."
+  --ref ref.wav --gen gen.wav --text "the gen text"
 
-TAG=value-frame_w1.0_h0.25_at2-4-6-8-10-12-14_s50_lr1e-2_smhidden
-CUDA_VISIBLE_DEVICES=2 python src/f5_tts/eval/batch_eval.py \
-  --gen-dir tto_outputs/$TAG \
+python src/f5_tts/eval/eval_metric.py \
+  --ref /home/yanzhang/F5-TTS/tto_eval/esd_emochange/refs/0012_happy2sad_012.wav --gen v_f_2,4,6,8,10,12,14_50_1e-2_1.0_0.25.wav --text "The fisherman and his wife see George every day. I believe you are one of them!"
+```
+
+### 批量：`batch_eval.py`
+
+**Flat 模式**（对应 `--ref-dir` 生成；全 batch 共用一个 gen_text，stem-by-stem 配对 ref）：
+
+```bash
+python src/f5_tts/eval/batch_eval.py \
+  --gen-dir tto_outputs/exp_batch \
   --ref-dir asset \
-  --gen-text "Dogs are sitting by the door. Dogs are sitting by the door." \
-  --out-csv tto_outputs/$TAG/metrics.csv
+  --gen-text "Dogs are walking on the floor. Dogs are walking on the floor." \
+  --out-csv tto_outputs/exp_batch/metrics.csv
+```
 
-for d in tto_outputs/*/; do
-  [ -f "$d/metrics.csv" ] || continue
-  CUDA_VISIBLE_DEVICES=2 python src/f5_tts/eval/batch_eval.py \
-    --gen-dir "$d" \
-    --ref-dir asset \
-    --gen-text "Dogs are sitting by the door. Dogs are sitting by the door." \
-    --out-csv "$d/metrics.csv"
-done
-
-# 批量生成 + 自动配对评测 (run_tto.sh)
-
-单次跑：从 `--ref-dir` 随机采 `--batch-size` 条 ref 生成，结束后自动对每条 gen/ref 配对调 `batch_eval.py`，CSV+summary 落到 `tto_outputs/<TAG>/`。TAG 形如 `<loss>-<vad>_w<ws>_h<hs>_at<oa>_s<steps>_lr<lr>_sm<slide-mode>`，不同组合互不覆盖。
+**Manifest 模式**（对应 `--manifest` 生成；每行独立 ref/gen_text）：
 
 ```bash
-./run_tto.sh                               # 默认: value+frame+hidden, w=1.0 h=0.5, 8 条
+python src/f5_tts/eval/batch_eval.py \
+  --gen-dir tto_outputs/esd_disjoint_spk0.01_asr0.0001 \
+  --manifest tto_eval/esd_emochange/manifest_disjoint.jsonl \
+  --out-csv tto_outputs/esd_disjoint_spk0.01_asr0.0001/metrics.csv
+```
+
+两种模式都产 `metrics.csv` + `metrics.summary.txt`。
+
+## Shell wrappers
+
+### `run_tto.sh` —— 单次跑（生成 + 自动配对评测）
+
+```bash
+./run_tto.sh                                          # 默认 value+frame，BATCH_SIZE=8
 ./run_tto.sh --loss-mode embedding --vad-level both --opt-steps 30
-./run_tto.sh --vad-slide-mode audio        # 切回旧的 audio-slide 实现做对照
-./run_tto.sh --skip-eval                   # 只生成，不评测
-
-# 查看结果
-ls tto_outputs/<TAG>/                      # metrics.csv + metrics.summary.txt + *.wav
-cat tto_outputs/*/metrics.summary.txt      # 所有 TAG 聚合统计
+./run_tto.sh --skip-eval                              # 只生成，不评测
 ```
 
-可配置项：`--window-size / --hop-size / --opt-at / --opt-steps / --opt-lr / --loss-mode / --vad-level / --vad-slide-mode / --batch-size / --ref-dir`。
+TAG 形如 `<loss>-<vad>_w<ws>_h<hs>_at<oa>_s<steps>_lr<lr>`，输出落 `tto_outputs/<TAG>/`。
+可配置项：`--window-size / --hop-size / --opt-at / --opt-steps / --opt-lr / --loss-mode / --vad-level / --batch-size / --ref-dir`。
 
-`--vad-slide-mode` 决定 frame 模式下 VAD 怎么提取：
+> 注：当前 `run_tto.sh` 仍走 legacy `--ref-dir` + 共用 `REF_TEXT/GEN_TEXT` 的 flat 模式。如需 manifest 评测，直接调上文 `tto.py --manifest` + `batch_eval.py --manifest` 两条命令。
 
-- **`hidden`** (默认): 整段音频一次过 wav2vec2 → `(T, 1024)` hidden state → 在时间轴上滑窗 mean → 分类头。**1 次 backbone forward**，每帧看到完整 attention 上下文，跟训练分布一致。
-- **`audio`** (legacy): 在原始音频上滑窗 → 每窗独立跑整个模型。**N 次 forward**，每帧只看 1 s 局部，OOD 输入。
-- 两种模式产出的 TAG 不同（`_smhidden` / `_smaudio`），可同时存放做对照实验。
+### `sweep_tto.sh` —— 多 config × 多 GPU 并行
 
-# 批量扫参 + 多 GPU 并行 (sweep_tto.sh)
-
-config 行格式：`ws|hs|opt_at|opt_steps|lr|loss_mode|vad_level|slide_mode`（8 字段），每行调一次 `run_tto.sh`，多卡时按任务队列动态分派。`slide_mode` 字段缺省时回落 `hidden`，旧的 7 字段 config 仍兼容。
+config 行格式：`ws|hs|opt_at|opt_steps|lr|loss_mode|vad_level`（7 字段），每行调一次 `run_tto.sh`。
 
 ```bash
-# 单 GPU 串行（原行为）
-./sweep_tto.sh
-
-# 4 卡并行
-./sweep_tto.sh --gpus 0-1
-
-# 多卡生成 + 串行评测（显存吃紧时推荐）
-./sweep_tto.sh --gpus 0-3 --defer-eval
-
-# 混合 GPU id
-./sweep_utmos.sh --gpus 1-3
+./sweep_tto.sh                               # 单 GPU 串行
+./sweep_tto.sh --gpus 0-3                    # 4 卡并行（工作队列动态分派）
+./sweep_tto.sh --gpus 0-3 --defer-eval       # 生成全跑完后再串行评测
 ```
 
-- **工作队列**：每张 GPU 始终只跑一个 config，跑完自动领下一个；不做静态切分，任务时长不均也不空转。
-- **日志分离**：并发 stdout 会互相覆盖，每个 run 的完整输出到 `tto_outputs/_logs/<ts>/<idx>_gpu<N>_<TAG>.log`，用 `tail -f` 跟进。
-- **`--defer-eval`**：生成阶段传 `--skip-eval` 给 `run_tto.sh`，全跑完后再在第一张 GPU 上串行评测——避免在 TTO 采样器之上再叠 ~5 GB 的 eval 模型栈。
-- **Ctrl-C**：trap 会杀掉所有 children，不留孤儿进程。
+- 每张 GPU 始终只跑一个 config，跑完自动领下一个；任务时长不均也不空转。
+- 并发 stdout 落 `tto_outputs/_logs/<ts>/<idx>_gpu<N>_<TAG>.log`，用 `tail -f` 跟。
+- `--defer-eval`：避免在 TTO 采样器之上再叠 ~5 GB 的 eval 模型栈。
+- Ctrl-C 会清掉所有 children，不留孤儿。
 
-跨 config 对比：
+### `run_exps.sh` —— 固定实验配置
 
 ```bash
+./run_exps.sh --gpus 0-1                     # exp55 + exp66 × NUM_RUNS
+./run_exps.sh --runs 3 --gpus 0-3            # 每 config 跑 3 次（不同 seed）
+```
+
+## 跨 config 聚合
+
+```bash
+# 快速看每个 TAG 的 summary
 for f in tto_outputs/*/metrics.summary.txt; do
-  echo "=== $f ==="; grep -E "^(spk_sim|e2v_sim_utt|e2v_sim_frame|av_sim_utt|av_sim_chunk|utmos|spk_sim|wer|cer)" "$f"
+  echo "=== $f ==="
+  grep -E "^(wer|cer|utmos|spk_sim|EMO-sim|av_sim|pcp_score)" "$f"
 done
 
-# 导出结果到csv分析
+# 导出 Excel-friendly CSV
 python src/f5_tts/infer/aggregate_sweep.py
 ```
 

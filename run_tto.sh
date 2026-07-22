@@ -7,14 +7,16 @@ HOP_SIZE=0.5
 OPT_AT="2,4,6,8,10,12,14,16,18,20,24,28"
 OPT_STEPS=50
 OPT_LR=1e-2
-LOSS_MODE=value          # value | embedding
+LOSS_MODE=embedding          # value | embedding
 VAD_LEVEL=frame          # frame | utter | both
-VAD_SLIDE_MODE=hidden    # hidden (默认: 整段一次 forward + hidden 滑窗) | audio (旧)
 BATCH_SIZE=8
 REF_DIR=asset
 REF_TEXT="Kids are talking by the door. Kids are talking by the door."
 GEN_TEXT="Dogs are walking on the floor. Dogs are walking on the floor."
 SKIP_EVAL=0
+# Paraformer all-token CE 附加 loss. 0=关闭. 总 loss = L_vad + ASR_WEIGHT·L_asr.
+ASR_WEIGHT=0
+ASR_MODEL="/mnt/disk1/models/speech_paraformer-large-vad-punc_asr_nat-en-16k-common-vocab10020"
 
 # 本地权重（留空则走 HF cache）。
 CKPT_FILE=/mnt/disk1/models/F5-TTS_Emilia-ZH-EN/model_1250000.safetensors
@@ -31,11 +33,10 @@ Usage: $0 [options]
   --opt-lr      VAL   (default: ${OPT_LR})
   --loss-mode   STR   value|embedding (default: ${LOSS_MODE})
   --vad-level   STR   frame|utter|both (default: ${VAD_LEVEL})
-  --vad-slide-mode STR  hidden|audio (default: ${VAD_SLIDE_MODE})
-                  hidden = single backbone forward + slide on hidden state
-                  audio  = legacy: per-window wav2vec2 forward (slower, OOD)
   --batch-size  INT   (default: ${BATCH_SIZE})
   --ref-dir     DIR   (default: ${REF_DIR})
+  --asr-weight  VAL   Paraformer all-token CE 权重 μ (default: ${ASR_WEIGHT}; 0=关闭)
+  --asr-model   ID    FunASR Paraformer 模型 id / 本地路径 (default: ${ASR_MODEL})
   --skip-eval         skip post-generation batch eval
   -h, --help
 EOF
@@ -50,9 +51,10 @@ while [[ $# -gt 0 ]]; do
     --opt-lr)      OPT_LR="$2";      shift 2 ;;
     --loss-mode)      LOSS_MODE="$2";       shift 2 ;;
     --vad-level)      VAD_LEVEL="$2";       shift 2 ;;
-    --vad-slide-mode) VAD_SLIDE_MODE="$2";  shift 2 ;;
     --batch-size)  BATCH_SIZE="$2";  shift 2 ;;
     --ref-dir)     REF_DIR="$2";     shift 2 ;;
+    --asr-weight)  ASR_WEIGHT="$2";  shift 2 ;;
+    --asr-model)   ASR_MODEL="$2";   shift 2 ;;
     --skip-eval)   SKIP_EVAL=1;      shift ;;
     -h|--help)     usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
@@ -61,9 +63,11 @@ done
 
 OPT_AT_SLUG="${OPT_AT//,/-}"
 # TAG prefixes loss-mode + vad-level so different loss configurations land in
-# sibling directories instead of overwriting each other. _sm<mode> suffix
-# distinguishes audio-slide vs hidden-slide implementations.
-TAG="${LOSS_MODE}-${VAD_LEVEL}_w${WINDOW_SIZE}_h${HOP_SIZE}_at${OPT_AT_SLUG}_s${OPT_STEPS}_lr${OPT_LR}_sm${VAD_SLIDE_MODE}"
+# sibling directories instead of overwriting each other. Append asr suffix when on.
+TAG="${LOSS_MODE}-${VAD_LEVEL}_w${WINDOW_SIZE}_h${HOP_SIZE}_at${OPT_AT_SLUG}_s${OPT_STEPS}_lr${OPT_LR}"
+if [[ "${ASR_WEIGHT}" != "0" && "${ASR_WEIGHT}" != "0.0" ]]; then
+  TAG="${TAG}_asr${ASR_WEIGHT}"
+fi
 
 cd "$(dirname "$0")"
 
@@ -81,10 +85,11 @@ python src/f5_tts/infer/tto.py \
   --loss-mode "${LOSS_MODE}" \
   --opt-at "${OPT_AT}" --opt-steps "${OPT_STEPS}" --opt-lr "${OPT_LR}" \
   --vad-level "${VAD_LEVEL}" \
-  --vad-slide-mode "${VAD_SLIDE_MODE}" \
   --window-size "${WINDOW_SIZE}" --hop-size "${HOP_SIZE}" \
   --batch-size "${BATCH_SIZE}" \
   --ref-dir "${REF_DIR}" \
+  --asr-loss-weight "${ASR_WEIGHT}" \
+  --asr-model "${ASR_MODEL}" \
   --output "${OUT_DIR}"
 
 if [[ "${SKIP_EVAL}" -eq 1 ]]; then

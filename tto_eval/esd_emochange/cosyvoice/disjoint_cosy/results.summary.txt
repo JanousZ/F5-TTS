@@ -1,0 +1,13 @@
+eval summary for /home/yanzhang/F5-TTS/tto_eval/esd_emochange/cosyvoice/disjoint (n=300, skipped=0, wall=236.6s)
+ref     : /home/yanzhang/F5-TTS/tto_eval/esd_emochange/manifest_disjoint.jsonl
+
+metric                   mean        std        min        max     n
+--------------------------------------------------------------------
+wer                    0.0509     0.0918     0.0000     0.5000   300
+utmos                  3.9546     0.3436     2.7442     4.4908   300
+spk_sim                0.6411     0.0748     0.3196     0.8016   300
+EMO-sim_utt            0.6879     0.2121     0.0633     0.9978   300
+EMO-sim_frame          0.6515     0.2056     0.0443     0.9947   300
+av_sim_utt             0.5874     0.5771    -0.9999     1.0000   300
+av_sim_chunk           0.4672     0.4057    -0.7290     0.9822   300
+pcp_score              3.4248     0.2300     2.7109     3.9176   300

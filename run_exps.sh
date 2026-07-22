@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 4 个 README 实验配置: exp1 / exp2 / exp3 / exp4。共同部分在底下变量里写一次,
-# 每行只列差异: tag | vad_level | extra_tto_args (UTMOS + grad-proj 或空)。
+# 共同部分在底下变量里写一次, 每行只列差异: tag | vad_level | extra_tto_args (空)。
 configs=(
-    "exp11|frame|"
-    "exp22|both|"
-    "exp33|both|--utmos-opt-at 2,4,6,8,10,12,14 --utmos-opt-steps 25 --utmos-weight 0.0001 --grad-proj ortho"
-    "exp44|frame|--utmos-opt-at 2,4,6,8,10,12,14 --utmos-opt-steps 25 --utmos-weight 0.0001 --grad-proj ortho"
+    "exp55|frame|"
+    "exp66|both|"
 )
 
 # Common knobs (4 个 config 完全一致)。
@@ -18,12 +15,12 @@ OPT_AT="2,4,6,8,10,12,14"
 OPT_STEPS=50
 OPT_LR=1e-2
 WINDOW_SIZE=1.0
-HOP_SIZE=0.5
+HOP_SIZE=0.25
 BATCH_SIZE=120
 REF_DIR=asset
 OUT_BASE=tto_outputs
-NUM_RUNS=4
-SEEDS=(12345 23456 34567 45678)
+NUM_RUNS=1
+SEEDS=(12345)
 
 GPUS="0"
 LOG_DIR=""
@@ -192,7 +189,7 @@ done
 
 echo
 echo "All ${total} jobs finished in $((SECONDS - t0))s."
-echo "Results     : ${OUT_BASE}/exp{1,2,3,4}/run{1..${NUM_RUNS}}/"
+echo "Results     : ${OUT_BASE}/exp{55,66}/run{1..${NUM_RUNS}}/"
 echo "Per-run logs: ${LOG_DIR}/"
 
 if [[ $SKIP_EVAL -eq 1 ]]; then

@@ -33,7 +33,7 @@ TAG_RE = re.compile(
 # Order of metric columns in the CSV (mean / std / min / max all kept).
 METRIC_ORDER = (
     "wer", "cer", "utmos", "spk_sim",
-    "e2v_sim_utt", "e2v_sim_frame",
+    "EMO-sim_utt", "EMO-sim_frame",
     "av_sim_utt", "av_sim_chunk",
     "pcp_score",
 )
@@ -76,6 +76,12 @@ def parse_summary(path: Path) -> dict:
     m = re.search(r"gen_text:\s*(.+)", text)
     if m: out["gen_text"] = m.group(1).strip().strip("'\"")
     # metric rows after the dashes
+    # Legacy summaries used `e2v_sim_*`; the live code emits `EMO-sim_*`.
+    # Map old → new so historical runs aggregate under the current columns.
+    NAME_REMAP = {
+        "e2v_sim_utt":   "EMO-sim_utt",
+        "e2v_sim_frame": "EMO-sim_frame",
+    }
     in_table = False
     for line in text.splitlines():
         s = line.strip()
@@ -85,8 +91,8 @@ def parse_summary(path: Path) -> dict:
         if not in_table or not s:
             continue
         parts = s.split()
-        if len(parts) >= 6 and parts[0].replace("_", "").isalnum():
-            name = parts[0]
+        if len(parts) >= 6 and parts[0].replace("_", "").replace("-", "").isalnum():
+            name = NAME_REMAP.get(parts[0], parts[0])
             try:
                 mean, std, mn, mx = (float(x) for x in parts[1:5])
             except ValueError:
@@ -123,9 +129,11 @@ def main() -> int:
         if args.pattern != "*" and not d.match(args.pattern):
             continue
         cfg = parse_tag(d.name)
-        if cfg is None:
-            skipped.append((d.name, "unparseable TAG"))
-            continue
+        # Unparseable TAG: config cols stay blank, but metrics are still
+        # filled from metrics.summary.txt so the row is useful.
+        unparseable = cfg is None
+        if unparseable:
+            cfg = {"tag": d.name}
         summary = d / "metrics.summary.txt"
         if not summary.exists():
             skipped.append((d.name, "no metrics.summary.txt"))
@@ -135,6 +143,8 @@ def main() -> int:
         except Exception as e:
             skipped.append((d.name, f"parse error: {e}"))
             continue
+        if unparseable:
+            skipped.append((d.name, "unparseable TAG (metrics only)"))
         rows.append({**cfg, **metrics})
 
     if not rows:

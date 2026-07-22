@@ -13,9 +13,9 @@ Metrics (all take gen_wav / ref_wav / gen_text + sampling rates, return dict):
     compute_emotion_sim  — emotion2vec_base_finetuned embedding similarity.
                            Reads the pipeline's frame-level ``feats`` (~50 Hz
                            hidden vectors). Returns:
-                             e2v_sim_utt   — cosine of mean-pooled utterance
+                             EMO-sim_utt   — cosine of mean-pooled utterance
                                              embeddings. ↑ better.
-                             e2v_sim_frame — per-frame cosine after gen→ref
+                             EMO-sim_frame — per-frame cosine after gen→ref
                                              length sync (nearest-neighbor
                                              interp). ↑ better.
                            Inputs MUST be wav file paths (modelscope pipeline
@@ -296,6 +296,13 @@ def _audio_emb_sync(z: np.ndarray, num_target_frames: int) -> np.ndarray:
     """
     from scipy.interpolate import interp1d
     z = np.asarray(z)
+    # Degenerate: 0 or 1 source frame → interp1d's domain has zero range,
+    # which scipy treats as a bounds violation. Just tile the single frame
+    # (the nearest-neighbor answer everywhere).
+    if len(z) <= 1:
+        if len(z) == 0:
+            raise ValueError("_audio_emb_sync: empty source embedding")
+        return np.broadcast_to(z, (num_target_frames,) + z.shape[1:]).astype("float32").copy()
     f = interp1d(np.linspace(0, 1, len(z)), z, axis=0, kind="nearest")
     return f(np.linspace(0, 1, num_target_frames)).astype("float32")
 
@@ -336,8 +343,8 @@ def compute_emotion_sim(
     """emotion2vec_base_finetuned embedding similarity (utt + frame).
 
     Returns:
-      e2v_sim_utt    cosine of mean-pooled utterance embeddings. ↑ better.
-      e2v_sim_frame  mean per-frame cosine after nearest-neighbor sync of
+      EMO-sim_utt    cosine of mean-pooled utterance embeddings. ↑ better.
+      EMO-sim_frame  mean per-frame cosine after nearest-neighbor sync of
                      gen frames to ref length. ↑ better.
 
     Requires file paths (modelscope pipeline reads wavs directly).
@@ -363,8 +370,8 @@ def compute_emotion_sim(
     sim_frame = _frame_cos_sim_mean(ref_np, gen_np)
 
     return {
-        "e2v_sim_utt": float(sim_utt),
-        "e2v_sim_frame": float(sim_frame),
+        "EMO-sim_utt": float(sim_utt),
+        "EMO-sim_frame": float(sim_frame),
     }
 
 
@@ -673,7 +680,7 @@ def evaluate_all(
     """Run all six metrics and merge results into a single dict.
 
     Keys: ``wer`` or ``cer``, ``hyp``, ``ref``, ``utmos``, ``spk_sim``,
-    ``e2v_sim_utt``, ``e2v_sim_frame``, ``av_sim_utt``, ``av_sim_chunk``,
+    ``EMO-sim_utt``, ``EMO-sim_frame``, ``av_sim_utt``, ``av_sim_chunk``,
     ``pcp_score``.
     """
     out: dict = {}
