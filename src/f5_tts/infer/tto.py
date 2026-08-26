@@ -21,7 +21,9 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 from f5_tts.infer.emo_loss import GradEmoExtractor, precompute_reference_emo
+from f5_tts.infer.emotion_vad_target import emotion_vad_target
 from f5_tts.infer.spk_loss import GradSpkExtractor, precompute_reference_spk_emb
+from f5_tts.infer.target_span import crop_waveform, target_latent_mask
 from f5_tts.infer.vad_loss import GradVADExtractor, precompute_reference_vad
 from f5_tts.model.utils import (
     convert_char_to_pinyin,
@@ -71,7 +73,13 @@ def _tto_inference_kit(
     window_size, hop_size,
     on_opt_step,
     vad_level: str = "frame",
+    vad_target_mode: str = "reference_audio",
+    emotion_vad_alpha: float = 1.0,
     ref_vad_utter: torch.Tensor | None = None,
+    target_span_sec: tuple[float, float] | None = None,
+    target_context_sec: float = 0.5,
+    target_latent_context_sec: float = 0.25,
+    latent_hop_length: int = 256,
     amp_scale: float = 1.0,
     spk: GradSpkExtractor | None = None,
     ref_spk_emb: torch.Tensor | None = None,
@@ -96,8 +104,18 @@ def _tto_inference_kit(
     # ------------------------------------------------------------------
     if loss_mode not in ("value", "embedding"):
         raise ValueError("loss_mode must be 'value' or 'embedding'")
-    if vad_level not in ("frame", "utter", "both"):
-        raise ValueError("vad_level must be 'frame', 'utter', or 'both'")
+    if vad_level not in ("frame", "utter", "both", "target"):
+        raise ValueError("vad_level must be 'frame', 'utter', 'both', or 'target'")
+    if vad_level == "target" and target_span_sec is None:
+        raise ValueError("vad_level='target' requires target_span_sec")
+    if vad_target_mode not in ("reference_audio", "emotion_proto"):
+        raise ValueError("vad_target_mode must be 'reference_audio' or 'emotion_proto'")
+    if not 0.0 <= emotion_vad_alpha <= 1.0:
+        raise ValueError("emotion_vad_alpha must be in [0, 1]")
+    if target_context_sec < 0.0 or target_latent_context_sec < 0.0:
+        raise ValueError("target context values must be non-negative")
+    if latent_hop_length <= 0:
+        raise ValueError("latent_hop_length must be positive")
     if vad_level == "both" and ref_vad_utter is None:
         raise ValueError("vad_level='both' requires ref_vad_utter")
     if vocoder_type not in ("vocos", "bigvgan"):
@@ -155,6 +173,18 @@ def _tto_inference_kit(
     valid_mask = lens_to_mask(duration)
     mask = valid_mask if batch > 1 else None
     ref_audio_len = int(lens[0].item())
+    local_latent_mask = None
+    if target_span_sec is not None:
+        local_latent_mask = target_latent_mask(
+            span=target_span_sec,
+            batch_size=batch,
+            latent_length=int(max_dur.item()),
+            prompt_length=ref_audio_len,
+            sample_rate=sample_rate,
+            latent_hop_length=latent_hop_length,
+            context_sec=target_latent_context_sec,
+            device=device,
+        )
 
     # ------------------------------------------------------------------
     # ODE grid + initial noise y0
@@ -227,6 +257,22 @@ def _tto_inference_kit(
         return F.mse_loss(g, r)
 
     def _vad_loss(wav: torch.Tensor) -> tuple[torch.Tensor, dict]:
+        if vad_level == "target":
+            target_wav = crop_waveform(
+                wav,
+                target_span_sec,
+                sample_rate=sample_rate,
+                context_sec=target_context_sec,
+            )
+            vad_in = target_wav.squeeze(0) if target_wav.shape[0] == 1 else target_wav
+            target_vad = vad(
+                vad_in,
+                in_sr=sample_rate,
+                utter=True,
+                embeddings=embeddings_flag,
+            )
+            loss = _mse_against(target_vad, ref_vad_features)
+            return loss, {"vad": float(loss.detach())}
         vad_in = wav.squeeze(0) if wav.shape[0] == 1 else wav
         total = None
         if vad_level in ("frame", "both"):
@@ -297,6 +343,16 @@ def _tto_inference_kit(
                 loss = loss + emo_weight * emo_l
                 comps.update(emo_comps)
         loss.backward()
+        if x_var.grad is not None:
+            grad_mask = (
+                local_latent_mask.to(x_var.grad.dtype)
+                if local_latent_mask is not None
+                else torch.ones_like(x_var.grad)
+            )
+            x_var.grad.mul_(grad_mask)
+            grad_norm = torch.linalg.vector_norm((x_var.grad * grad_mask).reshape(-1))
+            x_norm = torch.linalg.vector_norm((x_var.detach() * grad_mask).reshape(-1))
+            x_var.grad.mul_(x_norm / grad_norm.clamp_min(1e-8))
         optimizer.step()
         return float(loss.detach()), comps
 
@@ -304,10 +360,32 @@ def _tto_inference_kit(
                   n_iters: int, lr: float, step_idx: int) -> torch.Tensor:
         if n_iters <= 0:
             return x_t
-        x_var = x_t.detach().clone().float().requires_grad_(True)
+        x_base = x_t.detach().clone().float()
+        x_var = x_base.clone().requires_grad_(True)
         optimizer = torch.optim.Adam([x_var], lr=lr)
         for it in range(n_iters):
             loss_val, comps = _iter_vad(x_var, optimizer, t_cur)
+            delta = x_var.detach() - x_base
+            update_mask = (
+                local_latent_mask.to(delta.dtype)
+                if local_latent_mask is not None
+                else torch.ones_like(delta)
+            )
+            base_norm = torch.linalg.vector_norm((x_base * update_mask).reshape(-1))
+            delta_norm = torch.linalg.vector_norm((delta * update_mask).reshape(-1))
+            update_ratio = float(
+                (delta_norm / base_norm.clamp_min(1e-8)).cpu()
+            )
+            if update_ratio > 0.05:
+                scale = 0.05 / update_ratio
+                with torch.no_grad():
+                    projected = x_base + delta * scale
+                    if local_latent_mask is not None:
+                        projected = torch.where(
+                            local_latent_mask, projected, x_base,
+                        )
+                    x_var.copy_(projected)
+                update_ratio = 0.05
             if on_opt_step is not None:
                 on_opt_step(
                     step_idx, it, loss_val,
@@ -315,6 +393,7 @@ def _tto_inference_kit(
                     loss_spk=comps.get("spk"),
                     loss_asr=comps.get("asr"),
                     loss_emo=comps.get("emo"),
+                    update_ratio=update_ratio,
                 )
         cfm.transformer.clear_cache()
         return x_var.detach().to(dtype)
@@ -362,14 +441,20 @@ def sample_with_tto(
     sample_rate: int = 24000,
     # --- TTO knobs ---
     opt_schedule: Iterable[int] | Mapping[int, int] = (),
-    opt_steps: int = 3,
-    opt_lr: float = 1e-2,
+    opt_steps: int = 1,
+    opt_lr: float = 5e-3,
     opt_cfg_strength: float = 1.0,
     loss_mode: str = "value",
     window_size: float = 1.0,
     hop_size: float = 0.25,
     vad_level: str = "frame",
+    vad_target_mode: str = "reference_audio",
+    emotion_vad_alpha: float = 1.0,
     ref_vad_utter: torch.Tensor | None = None,
+    target_span_sec: tuple[float, float] | None = None,
+    target_context_sec: float = 0.5,
+    target_latent_context_sec: float = 0.25,
+    latent_hop_length: int = 256,
     on_opt_step: Callable[[int, int, float], None] | None = None,
     amp_scale: float = 1.0,
     spk: GradSpkExtractor | None = None,
@@ -406,7 +491,12 @@ def sample_with_tto(
         vocoder_type=vocoder_type, sample_rate=sample_rate,
         opt_cfg_strength=opt_cfg_strength, loss_mode=loss_mode,
         window_size=window_size, hop_size=hop_size,
-        vad_level=vad_level, ref_vad_utter=ref_vad_utter,
+        vad_level=vad_level, vad_target_mode=vad_target_mode,
+        emotion_vad_alpha=emotion_vad_alpha, ref_vad_utter=ref_vad_utter,
+        target_span_sec=target_span_sec,
+        target_context_sec=target_context_sec,
+        target_latent_context_sec=target_latent_context_sec,
+        latent_hop_length=latent_hop_length,
         on_opt_step=on_opt_step,
         amp_scale=amp_scale,
         spk=spk, ref_spk_emb=ref_spk_emb, spk_weight=spk_weight,
@@ -479,6 +569,19 @@ if __name__ == "__main__":
     parser.add_argument("--gen-text",
                         default="I don't really care what you call me. I've been a silent spectator.")
 
+    parser.add_argument("--target-audio", default=None,
+                        help="Target emotion reference audio for target-span supervision; defaults to --ref-audio")
+    parser.add_argument("--target-span-start-sec", type=float, default=None,
+                        help="Target span start time in generated audio seconds")
+    parser.add_argument("--target-span-end-sec", type=float, default=None,
+                        help="Target span end time in generated audio seconds")
+    parser.add_argument("--target-span-context-sec", type=float, default=0.5,
+                        help="Context added on both sides when cropping the generated target span")
+    parser.add_argument("--target-latent-context-sec", type=float, default=0.25,
+                        help="Context added around the local latent mask")
+    parser.add_argument("--latent-hop-length", type=int, default=hop_length,
+                        help="Approximate latent-to-sample hop length used by the local latent mask")
+
     # ---- ODE sampling -------------------------------------------------
     parser.add_argument("--steps", type=int, default=32)
     parser.add_argument("--cfg-strength", type=float, default=2.0)
@@ -486,18 +589,23 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
 
     # ---- VAD loss / TTO knobs (主要 loss) -----------------------------
-    parser.add_argument("--opt-at", default="2,4,6,8,10,12,14",
+    parser.add_argument("--opt-at", default="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15",
                         help="VAD TTO 触发的 ODE step 索引（逗号分隔）")
-    parser.add_argument("--opt-steps", type=int, default=50,
+    parser.add_argument("--opt-steps", type=int, default=1,
                         help="VAD TTO 每个点 Adam 内迭代步数")
-    parser.add_argument("--opt-lr", type=float, default=1e-2,
+    parser.add_argument("--opt-lr", type=float, default=5e-2,
                         help="VAD TTO Adam 学习率")
     parser.add_argument("--opt-cfg-strength", type=float, default=1.0)
     parser.add_argument("--loss-mode", choices=("value", "embedding"), default="embedding")
     parser.add_argument("--window-size", type=float, default=1.0)
     parser.add_argument("--hop-size", type=float, default=0.25)
-    parser.add_argument("--vad-level", choices=("frame", "utter", "both"), default="frame",
+    parser.add_argument("--vad-level", choices=("frame", "utter", "both", "target"), default="frame",
                         help="frame=framewise MSE; utter=utterance-level MSE; both=两者求和")
+    parser.add_argument("--vad-target-mode", choices=("reference_audio", "emotion_proto"),
+                        default="reference_audio",
+                        help="target VAD from target_audio or NRC emotion prototype")
+    parser.add_argument("--emotion-vad-alpha", type=float, default=1.0,
+                        help="interpolation strength from neutral midpoint to NRC emotion VAD")
 
     # ---- SIM-O speaker similarity loss (附加 loss, 加权和) -------------
     parser.add_argument("--spk-loss-weight", type=float, default=0.0,
@@ -538,49 +646,98 @@ if __name__ == "__main__":
     parser.add_argument("--ref-pattern", default="*.wav",
                         help="批量模式下的 ref 文件名 glob 模式")
     parser.add_argument("--manifest", default=None,
-                        help="JSONL 模式: 每行带 stem/ref_wav/ref_text/gen_text；"
-                             "ref_wav 相对路径以 manifest 父目录为基。"
+                        help="JSONL 模式: 每行带 stem/gen_text + ref_wav/ref_text 或 "
+                             "prompt_wav/prompt_text；可选 target_audio/target_span_sec。"
+                             "相对路径以 manifest 父目录为基。"
                              "与 --batch-size 互斥；--output 用作输出目录。")
     args = parser.parse_args()
 
     if args.manifest is not None and args.batch_size is not None:
         raise SystemExit("--manifest 与 --batch-size 互斥；只能选其一")
 
+    global_target_span_sec = None
+    if args.target_span_start_sec is not None or args.target_span_end_sec is not None:
+        if args.target_span_start_sec is None or args.target_span_end_sec is None:
+            raise SystemExit("--target-span-start-sec and --target-span-end-sec must be provided together")
+        global_target_span_sec = (args.target_span_start_sec, args.target_span_end_sec)
+
     import glob as _glob
     import json as _json
     import pathlib
     import random as _random
 
+    def _resolve_input_path(value: str | None, base: pathlib.Path) -> str | None:
+        if value is None:
+            return None
+        p = pathlib.Path(value)
+        if not p.is_absolute():
+            p = (base / p).resolve()
+        return str(p)
+
+    def _parse_target_span(value, *, row_desc: str) -> tuple[float, float] | None:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            pieces = [p.strip() for p in value.replace(",", " ").split() if p.strip()]
+        else:
+            pieces = list(value)
+        if len(pieces) != 2:
+            raise SystemExit(f"{row_desc} target_span_sec must contain exactly two values: {value!r}")
+        start, end = float(pieces[0]), float(pieces[1])
+        if not (start >= 0.0 and end > start):
+            raise SystemExit(f"{row_desc} invalid target_span_sec: {value!r}")
+        return start, end
+
     # ====================================================================
-    # job list: 统一成 [(ref_wav_path, out_path, ref_text, gen_text), ...]
+    # job list: normalize to a dict so manifest rows can override target audio/span.
     # ====================================================================
     if args.manifest is not None:
         manifest_path = pathlib.Path(args.manifest).resolve()
         manifest_base = manifest_path.parent
         rows: list[dict] = []
-        with open(manifest_path) as f:
+        with open(manifest_path, encoding="utf-8") as f:
             for i, line in enumerate(f, 1):
                 line = line.strip()
                 if not line:
                     continue
                 row = _json.loads(line)
-                for k in ("stem", "ref_wav", "ref_text", "gen_text"):
-                    if k not in row:
-                        raise SystemExit(f"manifest row {i} missing '{k}': {row}")
-                ref_p = pathlib.Path(row["ref_wav"])
-                if not ref_p.is_absolute():
-                    ref_p = (manifest_base / ref_p).resolve()
-                row["ref_wav"] = str(ref_p)
-                rows.append(row)
+                if "stem" not in row or "gen_text" not in row:
+                    raise SystemExit(f"manifest row {i} missing stem/gen_text: {row}")
+                ref_wav = row.get("ref_wav", row.get("prompt_wav"))
+                ref_text = row.get("ref_text", row.get("prompt_text"))
+                if ref_wav is None or ref_text is None:
+                    raise SystemExit(
+                        f"manifest row {i} needs prompt_wav/prompt_text "
+                        f"or ref_wav/ref_text: {row}"
+                    )
+                target_span_value = row.get("target_span_sec")
+                if target_span_value is None:
+                    start = row.get("target_span_start_sec")
+                    end = row.get("target_span_end_sec")
+                    if start is not None or end is not None:
+                        target_span_value = [start, end]
+                rows.append({
+                    **row,
+                    "stem": str(row["stem"]),
+                    "ref_wav": _resolve_input_path(ref_wav, manifest_base),
+                    "ref_text": str(ref_text),
+                    "speaker_wav": _resolve_input_path(row.get("speaker_wav"), manifest_base),
+                    "gen_text": str(row["gen_text"]),
+                    "target_audio": _resolve_input_path(row.get("target_audio"), manifest_base),
+                    "target_span_sec": _parse_target_span(
+                        target_span_value, row_desc=f"manifest row {i}",
+                    ),
+                })
         if not rows:
             raise SystemExit(f"manifest '{args.manifest}' 是空的")
         out_dir = args.output
         os.makedirs(out_dir, exist_ok=True)
-        jobs = [
-            (row["ref_wav"], os.path.join(out_dir, f"{row['stem']}.wav"),
-             row["ref_text"], row["gen_text"])
-            for row in rows
-        ]
+        jobs = []
+        for row in rows:
+            jobs.append({
+                **row,
+                "out_path": os.path.join(out_dir, f"{row['stem']}.wav"),
+            })
     elif args.batch_size is not None:
         candidates = sorted(_glob.glob(os.path.join(args.ref_dir, args.ref_pattern)))
         if not candidates:
@@ -592,12 +749,27 @@ if __name__ == "__main__":
         out_dir = args.output
         os.makedirs(out_dir, exist_ok=True)
         jobs = [
-            (rp, os.path.join(out_dir, f"{pathlib.Path(rp).stem}.wav"),
-             args.ref_text, args.gen_text)
+            {
+                "stem": pathlib.Path(rp).stem,
+                "ref_wav": rp,
+                "ref_text": args.ref_text,
+                "gen_text": args.gen_text,
+                "target_audio": args.target_audio,
+                "target_span_sec": global_target_span_sec,
+                "out_path": os.path.join(out_dir, f"{pathlib.Path(rp).stem}.wav"),
+            }
             for rp in ref_paths
         ]
     else:
-        jobs = [(args.ref_audio, args.output, args.ref_text, args.gen_text)]
+        jobs = [{
+            "stem": pathlib.Path(args.output).stem,
+            "ref_wav": args.ref_audio,
+            "ref_text": args.ref_text,
+            "gen_text": args.gen_text,
+            "target_audio": args.target_audio,
+            "target_span_sec": global_target_span_sec,
+            "out_path": args.output,
+        }]
 
     # ====================================================================
     # models (load ONCE) + schedule parsing
@@ -685,14 +857,31 @@ if __name__ == "__main__":
         duration = ref_audio_len + int(ref_audio_len / ref_text_len * gen_text_len)
         return ref_wav, text, duration, amp_scale, ref_wav_for_vad, sr
 
-    def _run_one(ref_audio_path: str, out_path: str,
-                 ref_text: str, gen_text: str) -> None:
+    def _run_one(job: dict) -> None:
+        ref_audio_path = job["ref_wav"]
+        ref_text = job["ref_text"]
+        gen_text = job["gen_text"]
+        out_path = job["out_path"]
+        active_target_span_sec = job.get("target_span_sec") or global_target_span_sec
+        if args.vad_level == "target" and active_target_span_sec is None:
+            raise SystemExit(
+                f"job '{job.get('stem', ref_audio_path)}' needs target_span_sec "
+                "when --vad-level target is used"
+            )
+        target_audio_path = job.get("target_audio") or args.target_audio or ref_audio_path
+        speaker_audio_path = job.get("speaker_wav") or ref_audio_path
         cond, text, duration, amp_scale, ref_wav_for_vad, sr = \
             _prepare_classic_inputs(ref_audio_path, ref_text, gen_text)
 
         # ---- precompute reference VAD ----
         emb_flag = (args.loss_mode == "embedding")
         ref_wav_1d = ref_wav_for_vad.squeeze(0)
+        target_wav_1d = None
+        target_sr = sr
+        if args.vad_level == "target" and args.vad_target_mode == "reference_audio":
+            target_wav_for_vad, target_sr = _load_mono(target_audio_path)
+            target_wav_for_vad = target_wav_for_vad.to(device)
+            target_wav_1d = target_wav_for_vad.squeeze(0)
 
         def _ref_vad(*, embeddings, utter):
             kw = {} if utter else dict(window_size=args.window_size, hop_size=args.hop_size)
@@ -701,7 +890,25 @@ if __name__ == "__main__":
                 embeddings=embeddings, utter=utter, **kw,
             )
 
-        if args.vad_level == "utter":
+        def _target_vad(*, embeddings, utter):
+            if target_wav_1d is None:
+                raise RuntimeError("target VAD requested before target audio was loaded")
+            kw = {} if utter else dict(window_size=args.window_size, hop_size=args.hop_size)
+            return precompute_reference_vad(
+                vad, target_wav_1d, in_sr=target_sr,
+                embeddings=embeddings, utter=utter, **kw,
+            )
+
+        if args.vad_level == "target":
+            if args.vad_target_mode == "emotion_proto":
+                ref_vad = emotion_vad_target(
+                    job.get("emotion", ""), alpha=args.emotion_vad_alpha,
+                    device=device, dtype=next(vad.parameters()).dtype,
+                ).view(1, 3)
+            else:
+                ref_vad = _target_vad(embeddings=emb_flag, utter=True)
+            ref_vad_u = None
+        elif args.vad_level == "utter":
             ref_vad, ref_vad_u = _ref_vad(embeddings=emb_flag, utter=True), None
         else:
             ref_vad = _ref_vad(embeddings=emb_flag, utter=False)
@@ -709,14 +916,21 @@ if __name__ == "__main__":
         print(
             f"ref VAD: primary={tuple(ref_vad.shape)} "
             f"utter={None if ref_vad_u is None else tuple(ref_vad_u.shape)} "
-            f"(loss_mode={args.loss_mode} vad_level={args.vad_level})"
+            f"(loss_mode={args.loss_mode} vad_level={args.vad_level} "
+            f"target_audio={'separate' if target_audio_path != ref_audio_path else 'same_as_ref'})"
         )
 
         # ---- precompute reference SIM-O speaker embedding ----
-        ref_spk_emb = (
-            precompute_reference_spk_emb(spk, ref_wav_1d, in_sr=sr)
-            if spk is not None else None
-        )
+        ref_spk_emb = None
+        if spk is not None:
+            if speaker_audio_path == ref_audio_path:
+                speaker_wav_1d, speaker_sr = ref_wav_1d, sr
+            else:
+                speaker_wav, speaker_sr = _load_mono(speaker_audio_path)
+                speaker_wav_1d = speaker_wav.to(device).squeeze(0)
+            ref_spk_emb = precompute_reference_spk_emb(
+                spk, speaker_wav_1d, in_sr=speaker_sr,
+            )
 
         # ---- precompute reference EMO-SIM frame features ----
         ref_emo = (
@@ -731,7 +945,7 @@ if __name__ == "__main__":
             asr_loss_mod.set_target(gen_text)
 
         def _log(step_idx, it, loss, *, loss_vad=None, loss_spk=None, loss_asr=None,
-                 loss_emo=None):
+                 loss_emo=None, update_ratio=None):
             parts = [f"loss={loss:.6f}"]
             if loss_vad is not None:
                 parts.append(f"vad={loss_vad:.6f}")
@@ -741,6 +955,8 @@ if __name__ == "__main__":
                 parts.append(f"asr={loss_asr:.6f}")
             if loss_emo is not None:
                 parts.append(f"emo={loss_emo:.6f}")
+            if update_ratio is not None:
+                parts.append(f"update_ratio={update_ratio:.4f}")
             print(f"[TTO][vad] step={step_idx:02d} iter={it} " + " ".join(parts))
 
         wav, _ = sample_with_tto(
@@ -763,7 +979,13 @@ if __name__ == "__main__":
             window_size=args.window_size,
             hop_size=args.hop_size,
             vad_level=args.vad_level,
+            vad_target_mode=args.vad_target_mode,
+            emotion_vad_alpha=args.emotion_vad_alpha,
             ref_vad_utter=ref_vad_u,
+            target_span_sec=active_target_span_sec,
+            target_context_sec=args.target_span_context_sec,
+            target_latent_context_sec=args.target_latent_context_sec,
+            latent_hop_length=args.latent_hop_length,
             vocoder_type=tts.mel_spec_type,
             sample_rate=target_sample_rate,
             on_opt_step=_log,
@@ -785,10 +1007,10 @@ if __name__ == "__main__":
     # main loop
     # ====================================================================
     total = len(jobs)
-    for idx, (rp, out_path, ref_text, gen_text) in enumerate(jobs, 1):
+    for idx, job in enumerate(jobs, 1):
         if total > 1:
-            print(f"\n=== [{idx}/{total}] ref={rp} ===")
-        _run_one(rp, out_path, ref_text, gen_text)
+            print(f"\n=== [{idx}/{total}] stem={job.get('stem')} ref={job['ref_wav']} ===")
+        _run_one(job)
 
     if total > 1:
-        print(f"\n批量完成: {total} 条输出保存在 {os.path.dirname(jobs[0][1])}")
+        print(f"\n批量完成: {total} 条输出保存在 {os.path.dirname(jobs[0]['out_path'])}")
